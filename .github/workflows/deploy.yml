@@ -13,12 +13,13 @@ jobs:
         uses: appleboy/ssh-action@v1.0.3
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
+          BOT_ENV: ${{ secrets.BOT_ENV }}
         with:
           host: ${{ secrets.OCI_HOST }}
           username: ubuntu
           key: ${{ secrets.OCI_SSH_KEY }}
           timeout: 120s
-          envs: GH_PAT
+          envs: GH_PAT,BOT_ENV
           script: |
             set -e
             BOT_DIR=/opt/ryze/ryze-discord-bot
@@ -41,6 +42,10 @@ jobs:
             cd "$BOT_DIR"
             git fetch "$REPO" master
             git reset --hard FETCH_HEAD
+
+            echo "==> Writing .env file..."
+            printf '%s' "$BOT_ENV" > "$BOT_DIR/.env"
+            chmod 600 "$BOT_DIR/.env"
 
             echo "==> Rebuilding bot container..."
             docker compose build bot
