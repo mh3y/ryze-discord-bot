@@ -21,7 +21,14 @@ jobs:
 
             echo "==> Pulling latest code..."
             cd "$BOT_DIR"
-            git pull origin master
+
+            # Wire up GitHub remote if not already set
+            if ! git remote get-url origin &>/dev/null 2>&1; then
+              git remote add origin https://github.com/mh3y/ryze-discord-bot.git
+            fi
+
+            git fetch origin master
+            git reset --hard origin/master
 
             echo "==> Rebuilding bot container..."
             docker compose build bot
