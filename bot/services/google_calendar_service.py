@@ -79,8 +79,12 @@ def list_calendars() -> list[dict]:
         log.info("Discovered %d calendar(s) from Google account.", len(calendars))
         return calendars
     except HttpError as exc:
-        log.error("Could not list Google calendars: %s", exc)
+        log.error("Could not list Google calendars (HttpError): %s", exc)
         return []
+    except Exception as exc:
+        # Catches google.auth.exceptions.RefreshError, TransportError, etc.
+        log.error("Could not list Google calendars (%s): %s", type(exc).__name__, exc)
+        raise  # Re-raise so the caller can log it as a sync failure
 
 
 def fetch_upcoming_events(calendar_id: str, days_ahead: int = 30) -> list[dict]:
@@ -103,8 +107,12 @@ def fetch_upcoming_events(calendar_id: str, days_ahead: int = 30) -> list[dict]:
             .execute()
         )
     except HttpError as exc:
-        log.error("Google Calendar API error for %s: %s", calendar_id, exc)
+        log.error("Google Calendar API error for %s (HttpError): %s", calendar_id, exc)
         return []
+    except Exception as exc:
+        # Catches google.auth.exceptions.RefreshError, TransportError, etc.
+        log.error("Google Calendar API error for %s (%s): %s", calendar_id, type(exc).__name__, exc)
+        raise  # Re-raise so the caller records it as a sync failure
 
     events = []
     skipped = 0
