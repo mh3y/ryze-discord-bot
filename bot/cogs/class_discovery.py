@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import logging
 import re
+from datetime import datetime, timezone
 
 import discord
 from discord import app_commands, Interaction
@@ -128,14 +129,39 @@ class ClassDiscoveryCog(commands.Cog):
         guild = self.bot.get_guild(config.DISCORD_GUILD_ID)
         if not guild:
             return
+        started = datetime.now(timezone.utc).isoformat()
         try:
             created, updated = await self._run_discovery(guild)
+            completed = datetime.now(timezone.utc).isoformat()
             if created:
                 log.info("Class discovery: %d new class(es) provisioned.", created)
             if updated:
                 log.info("Class discovery: %d class(es) had Discord IDs updated.", updated)
-        except Exception:
+            # Push sync audit log
+            if config.DASHBOARD_API_KEY and config.PORTAL_API_URL:
+                async with PortalAPIClient() as client:
+                    await client.push_sync_log(
+                        sync_type="classes",
+                        status="success",
+                        started_at=started,
+                        completed_at=completed,
+                        records_created=created,
+                        records_updated=updated,
+                    )
+        except Exception as exc:
             log.exception("Class discovery loop error.")
+            if config.DASHBOARD_API_KEY and config.PORTAL_API_URL:
+                try:
+                    async with PortalAPIClient() as client:
+                        await client.push_sync_log(
+                            sync_type="classes",
+                            status="failed",
+                            started_at=started,
+                            completed_at=datetime.now(timezone.utc).isoformat(),
+                            error_message=str(exc),
+                        )
+                except Exception:
+                    pass
 
     @_discovery_loop.before_loop
     async def _before_loop(self) -> None:

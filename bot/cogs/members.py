@@ -19,6 +19,7 @@ Admin commands (fallback / override)
 /link_class_role  — map a Discord role → class group (enables auto-enrol)
 """
 import logging
+from datetime import datetime, timezone
 
 import discord
 from discord import app_commands, Interaction
@@ -230,19 +231,53 @@ class MembersCog(commands.Cog):
 
         # ── Push snapshot to portal API (fire-and-forget with error logging) ──
         if portal_members and config.DASHBOARD_API_KEY and config.PORTAL_API_URL:
+            started = datetime.now(timezone.utc).isoformat()
             try:
                 async with PortalAPIClient() as client:
                     result = await client.sync_members(portal_members)
+                    completed = datetime.now(timezone.utc).isoformat()
                     log.info(
                         "Portal member sync complete: %d synced, %d created, %d updated.",
                         result.get("synced", 0),
                         result.get("created", 0),
                         result.get("updated", 0),
                     )
+                    await client.push_sync_log(
+                        sync_type="members",
+                        status="success",
+                        started_at=started,
+                        completed_at=completed,
+                        records_created=result.get("created", 0),
+                        records_updated=result.get("updated", 0),
+                    )
             except PortalAPIError as exc:
                 log.error("Portal member sync failed: %s", exc)
-            except Exception:
+                async with PortalAPIClient() as client:
+                    await client.push_sync_log(
+                        sync_type="members",
+                        status="failed",
+                        started_at=started,
+                        completed_at=datetime.now(timezone.utc).isoformat(),
+                        error_message=str(exc),
+                    )
+            except Exception as exc:
                 log.exception("Unexpected error pushing members to portal API.")
+                try:
+                    async with PortalAPIClient() as client:
+                        await client.push_sync_log(
+                            sync_type="members",
+                            status="failed",
+                            started_at=started,
+                            completed_at=datetime.now(timezone.utc).isoformat(),
+                            error_message=str(exc),
+                        )
+                except Exception:
+                    pass
+        elif not config.DASHBOARD_API_KEY or not config.PORTAL_API_URL:
+            log.warning(
+                "Member sync skipped for portal — DASHBOARD_API_KEY or PORTAL_API_URL not set. "
+                "Add both to the OCI .env and restart the bot."
+            )
 
         return created, enrolled
 

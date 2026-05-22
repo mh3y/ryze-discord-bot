@@ -194,3 +194,51 @@ class PortalAPIClient:
         if discord_channel_id is not None: payload["discord_channel_id"] = discord_channel_id
         if discord_role_id    is not None: payload["discord_role_id"]    = discord_role_id
         return await self._patch(f"/api/bot/classes/{class_id}", payload)
+
+    async def push_sync_log(
+        self,
+        sync_type:       str,
+        status:          str,
+        started_at:      str,
+        completed_at:    str | None   = None,
+        records_created: int          = 0,
+        records_updated: int          = 0,
+        records_failed:  int          = 0,
+        error_message:   str | None   = None,
+        source:          str          = "scheduled",
+        triggered_by:    str | None   = None,
+    ) -> dict:
+        """
+        POST /api/bot/sync-log
+
+        Records a sync audit entry in Supabase so the admin portal can show
+        last-sync times, record counts, and failure history per sync type.
+
+        sync_type:   members | classes | lessons | attendance
+        status:      running | success | partial | failed
+        started_at:  ISO 8601 string
+        completed_at: ISO 8601 string (or None if still running)
+        source:      scheduled | admin_triggered | slash_command
+        """
+        payload: dict = {
+            "sync_type":       sync_type,
+            "status":          status,
+            "started_at":      started_at,
+            "records_created": records_created,
+            "records_updated": records_updated,
+            "records_failed":  records_failed,
+            "source":          source,
+            "portal_api_url":  self._base,
+        }
+        if completed_at:   payload["completed_at"]  = completed_at
+        if error_message:  payload["error_message"] = error_message
+        if triggered_by:   payload["triggered_by"]  = triggered_by
+
+        try:
+            result = await self._post("/api/bot/sync-log", payload)
+            log.debug("[portal] sync-log pushed: %s %s", sync_type, status)
+            return result
+        except Exception as exc:
+            # Never let sync-log failure break the actual sync
+            log.warning("[portal] sync-log push failed (non-fatal): %s", exc)
+            return {}

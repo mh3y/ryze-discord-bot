@@ -20,7 +20,63 @@ COGS = [
     "bot.cogs.homework",
     "bot.cogs.admin",
     "bot.cogs.members",
+    "bot.cogs.bot_jobs",          # polls admin portal for queued sync jobs
 ]
+
+
+def _print_startup_health() -> None:
+    """
+    Print a clear startup health check to logs so you can immediately
+    confirm the bot is pointing at the right services.
+
+    Any ❌ here means the bot will not sync to the portal — check the OCI .env.
+    """
+    sep = "=" * 60
+
+    log.info(sep)
+    log.info("  RYZE EDUCATION BOT — STARTUP HEALTH CHECK")
+    log.info(sep)
+
+    # ── Discord ──────────────────────────────────────────────────────────────
+    log.info("[discord] Guild ID:        %s", config.DISCORD_GUILD_ID)
+
+    # ── Portal API sync ──────────────────────────────────────────────────────
+    api_url  = config.PORTAL_API_URL or ""
+    api_key  = config.DASHBOARD_API_KEY or ""
+    sync_ok  = bool(api_url and api_key)
+
+    log.info("[portal]  API URL:         %s", api_url or "❌ NOT SET  ← add PORTAL_API_URL to .env")
+    log.info("[portal]  API key set:     %s", "✓ yes" if api_key else "❌ NO  ← add DASHBOARD_API_KEY to .env")
+
+    if not api_url:
+        log.warning(
+            "[portal]  ⚠️  PORTAL_API_URL is not set. "
+            "Bot will NOT push members/lessons to the CRM portal. "
+            "Add: PORTAL_API_URL=https://ryze-portal-api.onrender.com"
+        )
+    if not api_key:
+        log.warning(
+            "[portal]  ⚠️  DASHBOARD_API_KEY is not set. "
+            "Bot will NOT push data to the CRM portal. "
+            "Add: DASHBOARD_API_KEY=<value of BOT_API_SECRET on Render>"
+        )
+    if sync_ok:
+        log.info("[portal]  ✅ Portal sync ENABLED — data will flow to Supabase via Render")
+    else:
+        log.warning("[portal]  ❌ Portal sync DISABLED — fix the variables above, then restart")
+
+    # ── Google Calendar ───────────────────────────────────────────────────────
+    gcal_ok = all([
+        config.GOOGLE_CLIENT_ID,
+        config.GOOGLE_CLIENT_SECRET,
+        config.GOOGLE_REFRESH_TOKEN,
+    ])
+    log.info("[gcal]    Calendar sync:   %s", "✓ configured" if gcal_ok else "❌ NOT configured — check GOOGLE_* env vars")
+
+    # ── Database ──────────────────────────────────────────────────────────────
+    log.info("[db]      DATABASE_URL:    %s", "✓ set" if config.DATABASE_URL else "❌ NOT SET")
+
+    log.info(sep)
 
 
 class RyzeBot(commands.Bot):
@@ -81,6 +137,7 @@ class RyzeBot(commands.Bot):
 
 async def main() -> None:
     setup_logging()
+    _print_startup_health()
     bot = RyzeBot()
     async with bot:
         await bot.start(config.DISCORD_TOKEN)
