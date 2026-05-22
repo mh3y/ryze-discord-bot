@@ -12,7 +12,7 @@ jobs:
       - name: Deploy to OCI via SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
-          host: 150.136.133.228
+          host: 159.13.52.6
           username: ubuntu
           key: ${{ secrets.OCI_SSH_KEY }}
           timeout: 120s
