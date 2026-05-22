@@ -1,0 +1,34 @@
+name: Deploy to OCI
+
+on:
+  push:
+    branches: [master]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to OCI via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: 150.136.133.228
+          username: ubuntu
+          key: ${{ secrets.OCI_SSH_KEY }}
+          timeout: 120s
+          script: |
+            set -e
+            BOT_DIR=/opt/ryze/ryze-discord-bot
+
+            echo "==> Pulling latest code..."
+            cd "$BOT_DIR"
+            git pull origin master
+
+            echo "==> Rebuilding bot container..."
+            docker compose build bot
+
+            echo "==> Restarting bot..."
+            docker compose up -d --no-deps bot
+
+            echo "==> Done. Showing last 20 lines of logs..."
+            sleep 3
+            docker compose logs bot --tail=20

@@ -1,0 +1,102 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ryze Education — Production Docker Compose
+#
+# Requires a .env file with at minimum:
+#   DB_PASSWORD, DISCORD_TOKEN, DISCORD_GUILD_ID, DASHBOARD_API_KEY,
+#   JWT_SECRET_KEY, GOOGLE_* credentials, DISCORD_CLIENT_ID/SECRET
+#
+# Start:   docker compose up -d
+# Update:  ./deploy/deploy.sh
+# Logs:    docker compose logs -f [service]
+# ─────────────────────────────────────────────────────────────────────────────
+
+x-db-url: &db-url
+  DATABASE_URL: postgresql+asyncpg://ryze_user:${DB_PASSWORD}@db:5432/ryze_bot
+
+services:
+
+  # ── PostgreSQL ─────────────────────────────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ryze_user
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set in .env}
+      POSTGRES_DB: ryze_bot
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ryze_user -d ryze_bot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── Database migrations (runs once, then exits) ────────────────────────────
+  migrate:
+    build: .
+    env_file: .env
+    environment:
+      <<: *db-url
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  # ── FastAPI dashboard / portal API ─────────────────────────────────────────
+  api:
+    build: .
+    env_file: .env
+    environment:
+      <<: *db-url
+    command:
+      - uvicorn
+      - bot.api.app:app
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8000"
+      - --workers
+      - "2"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    # Not exposed publicly — nginx proxies to it on the internal Docker network
+
+  # ── Discord bot ────────────────────────────────────────────────────────────
+  bot:
+    build: .
+    env_file: .env
+    environment:
+      <<: *db-url
+    command: ["python", "-m", "bot.main"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # ── Nginx + React frontend (public-facing) ─────────────────────────────────
+  web:
+    build:
+      context: ../Ryze-Education-Prototype
+      dockerfile: Dockerfile
+      args:
+        VITE_ENABLE_DASHBOARD: "true"
+        # Empty = same-origin; nginx routes /api/ and /auth/ to the API container
+        VITE_PORTAL_API_URL: ""
+        VITE_PORTAL_API_KEY: ${DASHBOARD_API_KEY}
+    depends_on:
+      - api
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      # Mount Let's Encrypt certs from the host (certbot renews them automatically)
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+    restart: unless-stopped
+
+volumes:
+  pgdata:

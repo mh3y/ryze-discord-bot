@@ -127,7 +127,7 @@ class BotJobsCog(commands.Cog):
         if not cog:
             raise RuntimeError("CalendarSyncCog not loaded — cannot run calendar sync")
         # Call the cog's sync loop body directly (same code path as scheduled)
-        from bot.services.lesson_service import sync_all_calendars
+        from bot.services.lesson_service import sync_all_calendars_portal as sync_all_calendars
         from datetime import datetime, timezone
         started = datetime.now(timezone.utc).isoformat()
         counts = await sync_all_calendars()
