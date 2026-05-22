@@ -11,15 +11,18 @@ jobs:
     steps:
       - name: Deploy to OCI via SSH
         uses: appleboy/ssh-action@v1.0.3
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
         with:
           host: ${{ secrets.OCI_HOST }}
           username: ubuntu
           key: ${{ secrets.OCI_SSH_KEY }}
           timeout: 120s
+          envs: GH_PAT
           script: |
             set -e
             BOT_DIR=/opt/ryze/ryze-discord-bot
-            REPO=https://github.com/mh3y/ryze-discord-bot.git
+            REPO=https://x-access-token:${GH_PAT}@github.com/mh3y/ryze-discord-bot.git
 
             echo "==> Pulling latest code..."
 
@@ -36,8 +39,8 @@ jobs:
             fi
 
             cd "$BOT_DIR"
-            git fetch origin master
-            git reset --hard origin/master
+            git fetch "$REPO" master
+            git reset --hard FETCH_HEAD
 
             echo "==> Rebuilding bot container..."
             docker compose build bot
