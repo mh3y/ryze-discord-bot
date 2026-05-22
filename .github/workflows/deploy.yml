@@ -14,12 +14,13 @@ jobs:
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
           BOT_ENV: ${{ secrets.BOT_ENV }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
         with:
           host: ${{ secrets.OCI_HOST }}
           username: ubuntu
           key: ${{ secrets.OCI_SSH_KEY }}
           timeout: 120s
-          envs: GH_PAT,BOT_ENV
+          envs: GH_PAT,BOT_ENV,DB_PASSWORD
           script: |
             set -e
             BOT_DIR=/opt/ryze/ryze-discord-bot
@@ -45,6 +46,8 @@ jobs:
 
             echo "==> Writing .env file..."
             printf '%s' "$BOT_ENV" > "$BOT_DIR/.env"
+            # Append DB_PASSWORD (managed as its own secret, not inside BOT_ENV)
+            printf '\nDB_PASSWORD=%s\n' "$DB_PASSWORD" >> "$BOT_DIR/.env"
             chmod 600 "$BOT_DIR/.env"
 
             echo "==> Rebuilding bot container..."
