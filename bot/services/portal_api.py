@@ -151,3 +151,46 @@ class PortalAPIClient:
             f"/api/bot/classes/{class_id}/set-calendar",
             {"google_calendar_id": google_calendar_id},
         )
+
+    async def create_class(
+        self,
+        name: str,
+        subject: str,
+        google_calendar_id: str,
+        discord_channel_id: str | None = None,
+        discord_role_id: str | None = None,
+        year_level: str | None = None,
+        description: str | None = None,
+    ) -> dict:
+        """
+        POST /api/bot/classes — idempotent (returns existing if calendar ID already registered).
+        Returns { id, created, class }.
+        """
+        payload: dict = {
+            "name":               name,
+            "subject":            subject,
+            "google_calendar_id": google_calendar_id,
+        }
+        if discord_channel_id: payload["discord_channel_id"] = discord_channel_id
+        if discord_role_id:    payload["discord_role_id"]    = discord_role_id
+        if year_level:         payload["year_level"]         = year_level
+        if description:        payload["description"]        = description
+
+        result = await self._post("/api/bot/classes", payload)
+        if result.get("created"):
+            log.info("[portal] Created class %r (id=%d)", name, result["id"])
+        else:
+            log.debug("[portal] Class %r already exists (id=%d)", name, result["id"])
+        return result
+
+    async def update_class_discord(
+        self,
+        class_id: int,
+        discord_channel_id: str | None = None,
+        discord_role_id: str | None = None,
+    ) -> dict:
+        """PATCH /api/bot/classes/:id — update Discord channel/role IDs."""
+        payload: dict = {}
+        if discord_channel_id is not None: payload["discord_channel_id"] = discord_channel_id
+        if discord_role_id    is not None: payload["discord_role_id"]    = discord_role_id
+        return await self._patch(f"/api/bot/classes/{class_id}", payload)
