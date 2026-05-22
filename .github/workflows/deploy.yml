@@ -19,15 +19,23 @@ jobs:
           script: |
             set -e
             BOT_DIR=/opt/ryze/ryze-discord-bot
+            REPO=https://github.com/mh3y/ryze-discord-bot.git
 
             echo "==> Pulling latest code..."
-            cd "$BOT_DIR"
 
-            # Wire up GitHub remote if not already set
-            if ! git remote get-url origin &>/dev/null 2>&1; then
-              git remote add origin https://github.com/mh3y/ryze-discord-bot.git
+            # Clone fresh if the directory isn't a git repo yet
+            if [ ! -d "$BOT_DIR/.git" ]; then
+              echo "    (first run — cloning repo into $BOT_DIR)"
+              sudo mkdir -p "$(dirname "$BOT_DIR")"
+              sudo chown ubuntu:ubuntu "$(dirname "$BOT_DIR")"
+              # If a non-git directory already exists, move it aside so git can clone
+              if [ -d "$BOT_DIR" ]; then
+                sudo mv "$BOT_DIR" "${BOT_DIR}.bak.$(date +%s)"
+              fi
+              git clone "$REPO" "$BOT_DIR"
             fi
 
+            cd "$BOT_DIR"
             git fetch origin master
             git reset --hard origin/master
 
