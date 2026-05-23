@@ -1,4 +1,5 @@
 """Cog: Voice attendance tracking and attendance slash commands."""
+import asyncio
 import logging
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -27,6 +28,7 @@ from bot.services.lesson_service import (
     get_class_group_by_voice_channel,
     get_lesson_by_id,
 )
+from bot.services.portal_api import PortalAPIClient
 from bot.utils.time_utils import SYDNEY_TZ, format_sydney, now_utc
 
 log = logging.getLogger(__name__)
@@ -283,7 +285,7 @@ class AttendanceCog(commands.Cog):
             await self._handle_leave(member, before.channel, now)
 
     async def _handle_join(
-        self, member: discord.Member, channel: discord.VoiceChannel, now
+        self, member: discord.Member, channel: discord.VoiceChannel, now: datetime
     ) -> None:
         async with get_session() as session:
             class_group = await get_class_group_by_voice_channel(session, channel.id)
@@ -295,11 +297,65 @@ class AttendanceCog(commands.Cog):
                     lesson.updated_at = now
             await open_voice_session(session, member.id, channel.id, lesson, joined_at=now)
 
+        # Push "active" session to portal immediately (fire-and-forget)
+        asyncio.create_task(self._push_voice_session_to_portal(
+            member=member,
+            channel=channel,
+            joined_at=now,
+            left_at=None,
+            status="active",
+        ))
+
     async def _handle_leave(
-        self, member: discord.Member, channel: discord.VoiceChannel, now
+        self, member: discord.Member, channel: discord.VoiceChannel, now: datetime
     ) -> None:
+        vs: Optional[VoiceSession] = None
         async with get_session() as session:
-            await close_voice_session(session, member.id, channel.id, left_at=now)
+            vs = await close_voice_session(session, member.id, channel.id, left_at=now)
+
+        if vs:
+            # Push completed session to portal (fire-and-forget)
+            asyncio.create_task(self._push_voice_session_to_portal(
+                member=member,
+                channel=channel,
+                joined_at=vs.joined_at,
+                left_at=now,
+                status="completed",
+            ))
+
+    async def _push_voice_session_to_portal(
+        self,
+        member: discord.Member,
+        channel: discord.VoiceChannel,
+        joined_at: datetime,
+        left_at: Optional[datetime],
+        status: str,
+    ) -> None:
+        """Push a single voice session to the CRM portal. Never raises."""
+        if not config.PORTAL_API_URL or not config.DASHBOARD_API_KEY:
+            return
+        try:
+            session_payload = {
+                "discord_user_id":    str(member.id),
+                "discord_username":   member.display_name,
+                "discord_channel_id": str(channel.id),
+                "discord_channel":    channel.name,
+                "joined_at":          joined_at.isoformat(),
+                "left_at":            left_at.isoformat() if left_at else None,
+                "status":             status,
+            }
+            async with PortalAPIClient() as client:
+                await client.push_voice_sessions([session_payload])
+            log.debug(
+                "Pushed voice session to portal: %s in %s (%s)",
+                member.display_name, channel.name, status,
+            )
+        except Exception:
+            log.warning(
+                "Failed to push voice session to portal for %s — non-fatal.",
+                member.display_name,
+                exc_info=True,
+            )
 
     # ------------------------------------------------------------------ #
     # Finalise attendance at lesson end

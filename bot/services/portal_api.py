@@ -195,6 +195,37 @@ class PortalAPIClient:
         if discord_role_id    is not None: payload["discord_role_id"]    = discord_role_id
         return await self._patch(f"/api/bot/classes/{class_id}", payload)
 
+    async def push_voice_sessions(
+        self,
+        sessions: list[dict],
+    ) -> dict:
+        """
+        POST /api/bot/sync-voice-sessions
+
+        Pushes voice-channel activity to the CRM portal.  Works with or without
+        a lesson_id — the CRM records every session even when the voice channel
+        is not yet mapped to a class.
+
+        Each session dict should contain:
+            discord_user_id:    str
+            discord_username:   str | None
+            discord_channel_id: str | None   (snowflake)
+            discord_channel:    str | None   (human-readable name)
+            joined_at:          str           (ISO 8601 UTC)
+            left_at:            str | None    (ISO 8601 UTC; omit for active sessions)
+            status:             str           "active" | "completed" | "unknown"
+        """
+        if not sessions:
+            return {"created": 0, "updated": 0}
+
+        result = await self._post("/api/bot/sync-voice-sessions", {"sessions": sessions})
+        log.info(
+            "[portal] push_voice_sessions: created=%d updated=%d",
+            result.get("created", 0),
+            result.get("updated", 0),
+        )
+        return result
+
     async def push_sync_log(
         self,
         sync_type:       str,
