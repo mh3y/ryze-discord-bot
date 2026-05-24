@@ -326,7 +326,11 @@ class ClassDiscoveryCog(commands.Cog):
         # 3. Get or create the class category
         category = await self._get_or_create_category(guild)
 
-        # 4. Create channel with permission overwrites so only role members + admins can see it
+        # 4. Create channel with permission overwrites so only role members + admins can see it.
+        #
+        # GUARDRAIL: These overwrites apply to a TEXT channel only — this function
+        # never creates or modifies voice channels.  Speak / Connect / UseVAD
+        # permissions are intentionally absent here; they must never be denied here.
         overwrites: dict = {
             guild.default_role: discord.PermissionOverwrite(read_messages=False),
         }
@@ -335,6 +339,8 @@ class ClassDiscoveryCog(commands.Cog):
                 read_messages=True,
                 send_messages=True,
                 read_message_history=True,
+                # NOTE: Do NOT add speak/connect/use_voice_activation here.
+                # This is a text channel; voice permissions live on voice channels only.
             )
         # Give admins access
         admin_role = next((r for r in guild.roles if r.name.lower() == "admin"), None)

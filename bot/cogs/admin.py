@@ -102,8 +102,16 @@ async def _assign_role(
         return f"Already has **{role.name}**."
     try:
         await member.add_roles(role, reason=reason)
+        log.info(
+            "[role] ADD  user=%s (id=%d)  role=%r  reason=%r",
+            member.display_name, member.id, role.name, reason,
+        )
         return f"✅ Assigned **{role.name}**."
     except discord.Forbidden:
+        log.warning(
+            "[role] ADD FAILED (Forbidden)  user=%s (id=%d)  role=%r",
+            member.display_name, member.id, role.name,
+        )
         return (
             f"⚠️ Could not assign **{role.name}** — check that the bot role "
             f"sits above **{role.name}** in Server Settings → Roles."
@@ -122,8 +130,16 @@ async def _remove_role(
         return None
     try:
         await member.remove_roles(role, reason=reason)
+        log.info(
+            "[role] REMOVE  user=%s (id=%d)  role=%r  reason=%r",
+            member.display_name, member.id, role.name, reason,
+        )
         return f"Removed **{role.name}**."
     except discord.Forbidden:
+        log.warning(
+            "[role] REMOVE FAILED (Forbidden)  user=%s (id=%d)  role=%r",
+            member.display_name, member.id, role.name,
+        )
         return f"⚠️ Could not remove **{role.name}** (missing permissions)."
 
 
@@ -866,6 +882,166 @@ class AdminCog(commands.Cog):
                 msg = f"Assigned {discord_member.mention} as **{role.value}** in **{group.name}**."
 
         await interaction.followup.send(msg, ephemeral=True)
+
+
+    # ------------------------------------------------------------------ #
+    # /debug_permissions
+    # ------------------------------------------------------------------ #
+
+    @app_commands.command(
+        name="debug_permissions",
+        description="Diagnose why a member is suppressed or cannot speak in a voice channel.",
+    )
+    @app_commands.guild_only()
+    @app_commands.describe(
+        member="The Discord member to inspect",
+        channel="The voice channel to check",
+    )
+    @app_commands.default_permissions(administrator=True)
+    async def debug_permissions(
+        self,
+        interaction: Interaction,
+        member: discord.Member,
+        channel: discord.VoiceChannel,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+
+        perms = channel.permissions_for(member)
+
+        # Collect channel-level overwrites that apply to this member or their roles
+        channel_overwrites: list[str] = []
+        for target, ow in channel.overwrites.items():
+            applies = (
+                (isinstance(target, discord.Role) and (
+                    target in member.roles or target == interaction.guild.default_role
+                ))
+                or (isinstance(target, discord.Member) and target.id == member.id)
+            )
+            if not applies:
+                continue
+            label = f"@{target.name}" if isinstance(target, discord.Role) else "member-specific"
+            bits: list[str] = []
+            for attr, name in [
+                ("connect",              "Connect"),
+                ("speak",                "Speak"),
+                ("use_voice_activation", "Use VAD"),
+                ("stream",               "Stream"),
+            ]:
+                val = getattr(ow, attr)
+                if val is False:
+                    bits.append(f"❌ {name}")
+                elif val is True:
+                    bits.append(f"✅ {name}")
+            if bits:
+                channel_overwrites.append(f"**{label}**: {' · '.join(bits)}")
+
+        # Category-level overwrites
+        category_overwrites: list[str] = []
+        if channel.category:
+            for target, ow in channel.category.overwrites.items():
+                applies = (
+                    (isinstance(target, discord.Role) and (
+                        target in member.roles or target == interaction.guild.default_role
+                    ))
+                    or (isinstance(target, discord.Member) and target.id == member.id)
+                )
+                if not applies:
+                    continue
+                label = f"@{target.name}" if isinstance(target, discord.Role) else "member-specific"
+                bits = []
+                for attr, name in [
+                    ("connect",              "Connect"),
+                    ("speak",                "Speak"),
+                    ("use_voice_activation", "Use VAD"),
+                ]:
+                    val = getattr(ow, attr)
+                    if val is False:
+                        bits.append(f"❌ {name}")
+                    elif val is True:
+                        bits.append(f"✅ {name}")
+                if bits:
+                    category_overwrites.append(f"**{label}**: {' · '.join(bits)}")
+
+        all_ok = perms.connect and perms.speak
+        embed = discord.Embed(
+            title="🔍  Permission Diagnostic",
+            description=f"**{member.display_name}** in **{channel.name}**",
+            colour=discord.Colour.brand_green() if all_ok else discord.Colour.brand_red(),
+        )
+
+        # Membership Screening state
+        if member.pending:
+            screening = (
+                "⚠️ **PENDING** — this member has NOT completed Membership Screening.\n"
+                "They are suppressed in voice channels until screened.\n"
+                "Fix: right-click their name → **Verify Member**, or disable Membership Screening "
+                "in **Server Settings → Community**."
+            )
+        else:
+            screening = "✅ Complete (or not required)"
+        embed.add_field(name="Membership Screening", value=screening, inline=False)
+
+        # Roles
+        role_names = [r.name for r in member.roles[1:]]  # skip @everyone
+        embed.add_field(
+            name=f"Roles ({len(role_names)})",
+            value=", ".join(role_names) if role_names else "*None assigned*",
+            inline=False,
+        )
+
+        # Effective permissions
+        embed.add_field(
+            name="Effective Permissions",
+            value=(
+                f"{'✅' if perms.connect else '❌'}  Connect\n"
+                f"{'✅' if perms.speak else '❌'}  Speak\n"
+                f"{'✅' if perms.use_voice_activation else '❌'}  Use Voice Activity\n"
+                f"{'✅' if perms.stream else '❌'}  Stream"
+            ),
+            inline=True,
+        )
+
+        # Channel overwrites
+        embed.add_field(
+            name=f"Channel Overwrites  ({channel.name})",
+            value="\n".join(channel_overwrites) if channel_overwrites else "None affecting this member",
+            inline=False,
+        )
+
+        # Category overwrites
+        if channel.category:
+            embed.add_field(
+                name=f"Category Overwrites  ({channel.category.name})",
+                value="\n".join(category_overwrites) if category_overwrites else "None affecting this member",
+                inline=False,
+            )
+
+        # Root-cause diagnosis
+        if member.pending:
+            diagnosis = (
+                "**Root cause: Membership Screening is pending.**\n"
+                "Discord suppresses voice speaking for all pending members regardless of channel permissions.\n"
+                "→ Right-click member → **Verify Member** to unblock immediately.\n"
+                "→ Or disable Membership Screening in **Server Settings → Community → Membership Screening**."
+            )
+        elif not perms.connect:
+            diagnosis = "**Root cause: `Connect` is denied.** Review the overwrites listed above."
+        elif not perms.speak:
+            diagnosis = "**Root cause: `Speak` is denied.** Review the overwrites listed above."
+        else:
+            diagnosis = "✅ No permission issues detected — member should be able to speak in this channel."
+
+        embed.add_field(name="Diagnosis", value=diagnosis, inline=False)
+
+        log.info(
+            "[debug_permissions] user=%s (id=%d) channel=%r | "
+            "connect=%s speak=%s use_vad=%s pending=%s | roles=[%s]",
+            member.display_name, member.id, channel.name,
+            perms.connect, perms.speak, perms.use_voice_activation, member.pending,
+            ", ".join(r.name for r in member.roles[1:]) or "none",
+        )
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 async def setup(bot: commands.Bot) -> None:

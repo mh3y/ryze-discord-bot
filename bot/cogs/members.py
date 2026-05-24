@@ -64,8 +64,16 @@ async def _assign_discord_role(guild: discord.Guild, member: discord.Member, rol
         return f"Already has **{role.name}**."
     try:
         await member.add_roles(role, reason="Assigned via Ryze bot")
+        log.info(
+            "[role] ADD  user=%s (id=%d)  role=%r  source=members_cog",
+            member.display_name, member.id, role.name,
+        )
         return f"✅ Assigned **{role.name}**."
     except discord.Forbidden:
+        log.warning(
+            "[role] ADD FAILED (Forbidden)  user=%s (id=%d)  role=%r  source=members_cog",
+            member.display_name, member.id, role.name,
+        )
         return f"⚠️ Could not assign **{role.name}** — check bot role hierarchy."
 
 
