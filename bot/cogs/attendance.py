@@ -287,17 +287,30 @@ class AttendanceCog(commands.Cog):
     async def _handle_join(
         self, member: discord.Member, channel: discord.VoiceChannel, now: datetime
     ) -> None:
-        async with get_session() as session:
-            class_group = await get_class_group_by_voice_channel(session, channel.id)
-            lesson = None
-            if class_group:
-                lesson = await get_active_lesson_for_channel(session, class_group.id, now)
-                if lesson and lesson.status == LessonStatus.scheduled:
-                    lesson.status = LessonStatus.active
-                    lesson.updated_at = now
-            await open_voice_session(session, member.id, channel.id, lesson, joined_at=now)
+        log.info(
+            "[voice] JOIN  user=%s (id=%d)  channel=%r",
+            member.display_name, member.id, channel.name,
+        )
+        # Local DB write is best-effort — a DB failure must NOT block the portal push,
+        # because the portal (Supabase) is the source of truth for attendance.
+        try:
+            async with get_session() as session:
+                class_group = await get_class_group_by_voice_channel(session, channel.id)
+                lesson = None
+                if class_group:
+                    lesson = await get_active_lesson_for_channel(session, class_group.id, now)
+                    if lesson and lesson.status == LessonStatus.scheduled:
+                        lesson.status = LessonStatus.active
+                        lesson.updated_at = now
+                await open_voice_session(session, member.id, channel.id, lesson, joined_at=now)
+        except Exception:
+            log.warning(
+                "[voice] Local DB write failed for JOIN %s in %r — portal push will still proceed.",
+                member.display_name, channel.name,
+                exc_info=True,
+            )
 
-        # Push "active" session to portal immediately (fire-and-forget)
+        # Portal push always runs regardless of local DB state.
         asyncio.create_task(self._push_voice_session_to_portal(
             member=member,
             channel=channel,
@@ -309,9 +322,21 @@ class AttendanceCog(commands.Cog):
     async def _handle_leave(
         self, member: discord.Member, channel: discord.VoiceChannel, now: datetime
     ) -> None:
+        log.info(
+            "[voice] LEAVE  user=%s (id=%d)  channel=%r",
+            member.display_name, member.id, channel.name,
+        )
         vs: Optional[VoiceSession] = None
-        async with get_session() as session:
-            vs = await close_voice_session(session, member.id, channel.id, left_at=now)
+        # Local DB write is best-effort.  A DB failure still allows portal push.
+        try:
+            async with get_session() as session:
+                vs = await close_voice_session(session, member.id, channel.id, left_at=now)
+        except Exception:
+            log.warning(
+                "[voice] Local DB write failed for LEAVE %s in %r — portal push will still proceed.",
+                member.display_name, channel.name,
+                exc_info=True,
+            )
 
         if vs:
             # Push completed session to portal (fire-and-forget)
@@ -322,6 +347,20 @@ class AttendanceCog(commands.Cog):
                 left_at=now,
                 status="completed",
             ))
+        else:
+            # Local DB had no open session (or DB failed) — push with minimal data so
+            # the portal still records the event.
+            asyncio.create_task(self._push_voice_session_to_portal(
+                member=member,
+                channel=channel,
+                joined_at=now,   # best estimate: treat leave time as join time
+                left_at=now,
+                status="completed",
+            ))
+            log.warning(
+                "[voice] No open local session for LEAVE %s in %r — pushing stub completed session to portal.",
+                member.display_name, channel.name,
+            )
 
     async def _push_voice_session_to_portal(
         self,
@@ -330,32 +369,47 @@ class AttendanceCog(commands.Cog):
         joined_at: datetime,
         left_at: Optional[datetime],
         status: str,
+        _attempt: int = 1,
     ) -> None:
-        """Push a single voice session to the CRM portal. Never raises."""
+        """Push a single voice session to the CRM portal. Retries up to 3 times. Never raises."""
         if not config.PORTAL_API_URL or not config.DASHBOARD_API_KEY:
             return
+        session_payload = {
+            "discord_user_id":    str(member.id),
+            "discord_username":   member.display_name,
+            "discord_channel_id": str(channel.id),
+            "discord_channel":    channel.name,
+            "joined_at":          joined_at.isoformat(),
+            "left_at":            left_at.isoformat() if left_at else None,
+            "status":             status,
+        }
         try:
-            session_payload = {
-                "discord_user_id":    str(member.id),
-                "discord_username":   member.display_name,
-                "discord_channel_id": str(channel.id),
-                "discord_channel":    channel.name,
-                "joined_at":          joined_at.isoformat(),
-                "left_at":            left_at.isoformat() if left_at else None,
-                "status":             status,
-            }
             async with PortalAPIClient() as client:
                 await client.push_voice_sessions([session_payload])
-            log.debug(
-                "Pushed voice session to portal: %s in %s (%s)",
-                member.display_name, channel.name, status,
+            log.info(
+                "[voice] PORTAL_PUSH ok  user=%s  channel=%r  status=%s  attempt=%d",
+                member.display_name, channel.name, status, _attempt,
             )
-        except Exception:
-            log.warning(
-                "Failed to push voice session to portal for %s — non-fatal.",
-                member.display_name,
-                exc_info=True,
-            )
+        except Exception as exc:
+            if _attempt < 3:
+                delay = 5 * _attempt  # 5s, 10s
+                log.warning(
+                    "[voice] PORTAL_PUSH failed (attempt %d/3) for %s in %r — retrying in %ds: %s",
+                    _attempt, member.display_name, channel.name, delay, exc,
+                )
+                await asyncio.sleep(delay)
+                await self._push_voice_session_to_portal(
+                    member=member, channel=channel,
+                    joined_at=joined_at, left_at=left_at,
+                    status=status, _attempt=_attempt + 1,
+                )
+            else:
+                log.error(
+                    "[voice] PORTAL_PUSH FAILED (all 3 attempts) for %s in %r (status=%s joined=%s) — "
+                    "session is in local DB but NOT in portal. Manual backfill may be required.",
+                    member.display_name, channel.name, status, joined_at.isoformat(),
+                    exc_info=True,
+                )
 
     # ------------------------------------------------------------------ #
     # Finalise attendance at lesson end
