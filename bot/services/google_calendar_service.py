@@ -87,9 +87,15 @@ def list_calendars() -> list[dict]:
         raise  # Re-raise so the caller can log it as a sync failure
 
 
-def fetch_upcoming_events(calendar_id: str, days_ahead: int = 30) -> list[dict]:
-    """Return parsed event dicts for the given calendar over the next *days_ahead* days."""
+def fetch_upcoming_events(calendar_id: str, days_ahead: int = 30, days_back: int = 14) -> list[dict]:
+    """Return parsed event dicts for the given calendar.
+
+    Fetches from *days_back* days ago through *days_ahead* days into the future.
+    The lookback window ensures that lessons missed during a token outage are
+    backfilled automatically on the next successful sync.
+    """
     now = datetime.now(timezone.utc)
+    time_min = now - timedelta(days=days_back)
     time_max = now + timedelta(days=days_ahead)
 
     try:
@@ -98,7 +104,7 @@ def fetch_upcoming_events(calendar_id: str, days_ahead: int = 30) -> list[dict]:
             service.events()
             .list(
                 calendarId=calendar_id,
-                timeMin=now.isoformat(),
+                timeMin=time_min.isoformat(),
                 timeMax=time_max.isoformat(),
                 singleEvents=True,
                 orderBy="startTime",
