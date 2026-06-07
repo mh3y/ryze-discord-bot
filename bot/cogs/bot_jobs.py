@@ -5,17 +5,21 @@ The admin portal queues jobs via POST /api/admin/bot-jobs.
 This cog polls GET /api/bot/jobs/pending every 30 seconds and executes
 recognised job types immediately.
 
-Supported job types (queued from Bot Health page):
-  sync_members   — runs the same member sync as the 6-hour scheduled loop
-  sync_classes   — runs the same class discovery as the periodic loop
-  sync_lessons   — runs the same calendar sync as the periodic loop
-  sync_attendance — future (no-op for now, logged)
+Supported job types:
+  sync_members            — runs the same member sync as the 6-hour scheduled loop
+  sync_classes            — runs the same class discovery as the periodic loop
+  sync_lessons            — runs the same calendar sync as the periodic loop
+  sync_attendance         — no-op (attendance captured via real-time voice events)
+  discord_permission_sync — apply/revoke per-channel permission overwrites for
+                            a class's enrolled students and tutor
 """
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import aiohttp
+import discord
 from discord.ext import commands, tasks
 
 from bot import config
@@ -81,7 +85,7 @@ class BotJobsCog(commands.Cog):
             log.info("[bot_jobs] Executing job #%d: %s", job_id, job_type)
 
             try:
-                await self._execute(job_type)
+                await self._execute(job_type, job)
                 await _complete_job(job_id)
                 log.info("[bot_jobs] Job #%d (%s) completed.", job_id, job_type)
             except Exception as exc:
@@ -92,7 +96,7 @@ class BotJobsCog(commands.Cog):
     async def _before_poll(self) -> None:
         await self.bot.wait_until_ready()
 
-    async def _execute(self, job_type: str) -> None:
+    async def _execute(self, job_type: str, job: dict[str, Any]) -> None:
         if job_type == "sync_members":
             await self._trigger_member_sync()
         elif job_type == "sync_classes":
@@ -100,9 +104,82 @@ class BotJobsCog(commands.Cog):
         elif job_type == "sync_lessons":
             await self._trigger_calendar_sync()
         elif job_type == "sync_attendance":
-            log.info("[bot_jobs] sync_attendance: attendance is captured in real-time via voice events — no manual trigger needed.")
+            log.info("[bot_jobs] sync_attendance: attendance captured in real-time — no manual trigger needed.")
+        elif job_type == "discord_permission_sync":
+            payload = job.get("payload") or {}
+            await self._trigger_discord_permission_sync(payload)
         else:
             log.warning("[bot_jobs] Unknown job type: %r — skipping.", job_type)
+
+    async def _trigger_discord_permission_sync(self, payload: dict[str, Any]) -> None:
+        """
+        Apply channel permission overwrites from a CRM discord_permission_sync job.
+
+        Payload fields (all optional — skip gracefully if absent):
+          channel_id         — Discord channel snowflake (string)
+          tutor_discord_id   — Discord user snowflake for the tutor (string | None)
+          grant_discord_ids  — list of snowflake strings to grant view+send access
+          revoke_discord_ids — list of snowflake strings to revoke access
+        """
+        channel_id_str: str | None = payload.get("channel_id")
+        if not channel_id_str:
+            log.warning("[bot_jobs] discord_permission_sync: no channel_id in payload — skipping.")
+            return
+
+        guild = self.bot.get_guild(config.DISCORD_GUILD_ID)
+        if not guild:
+            raise RuntimeError(f"Guild {config.DISCORD_GUILD_ID} not in cache")
+
+        channel = guild.get_channel(int(channel_id_str))
+        if not channel:
+            raise RuntimeError(f"Channel {channel_id_str} not found in guild")
+
+        # Permissions granted to enrolled tutors/students:
+        #   view_channel=True, send_messages=True, read_message_history=True
+        allow_overwrite = discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+        )
+        # Revoking explicitly hides the channel for that member.
+        deny_overwrite = discord.PermissionOverwrite(view_channel=False)
+
+        grant_ids: list[str] = payload.get("grant_discord_ids") or []
+        revoke_ids: list[str] = payload.get("revoke_discord_ids") or []
+
+        # Also ensure the tutor has access
+        tutor_discord_id: str | None = payload.get("tutor_discord_id")
+        if tutor_discord_id and tutor_discord_id not in grant_ids:
+            grant_ids = [tutor_discord_id, *grant_ids]
+
+        for snowflake in grant_ids:
+            member = guild.get_member(int(snowflake))
+            if member:
+                await channel.set_permissions(member, overwrite=allow_overwrite, reason="CRM discord_permission_sync — enrol")
+                log.debug("[bot_jobs] Granted %s access to #%s", member, channel)
+            else:
+                log.warning("[bot_jobs] discord_permission_sync: member %s not in guild — skipping grant.", snowflake)
+
+        for snowflake in revoke_ids:
+            # Safety: never revoke the tutor or anyone already being granted access
+            if snowflake in grant_ids:
+                log.info("[bot_jobs] discord_permission_sync: %s is in grant list — skipping revoke.", snowflake)
+                continue
+            member = guild.get_member(int(snowflake))
+            if member:
+                # Safety: never strip permissions from server admins or server owner
+                if member.guild_permissions.administrator or member == guild.owner:
+                    log.warning("[bot_jobs] discord_permission_sync: skipping revoke for admin/owner %s", member)
+                    continue
+                await channel.set_permissions(member, overwrite=deny_overwrite, reason="CRM discord_permission_sync — unenrol")
+                log.debug("[bot_jobs] Revoked %s access to #%s", member, channel)
+            else:
+                log.debug("[bot_jobs] discord_permission_sync: member %s not in guild — skipping revoke.", snowflake)
+
+        log.info(
+            "[bot_jobs] discord_permission_sync: channel=%s granted=%d revoked=%d",
+            channel_id_str, len(grant_ids), len(revoke_ids),
+        )
 
     async def _trigger_member_sync(self) -> None:
         cog = self.bot.cogs.get("MembersCog")
