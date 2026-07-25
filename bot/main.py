@@ -21,6 +21,7 @@ COGS = [
     "bot.cogs.admin",
     "bot.cogs.members",
     "bot.cogs.bot_jobs",          # polls admin portal for queued sync jobs
+    "bot.cogs.heartbeat",         # pings a dead-man's-switch so an outage is visible
 ]
 
 
@@ -29,7 +30,7 @@ def _print_startup_health() -> None:
     Print a clear startup health check to logs so you can immediately
     confirm the bot is pointing at the right services.
 
-    Any ❌ here means the bot will not sync to the portal — check the OCI .env.
+    Any ❌ here means the bot will not sync to the portal — check the deploy env vars.
     """
     sep = "=" * 60
 

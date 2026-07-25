@@ -28,6 +28,12 @@ GOOGLE_PROJECT_ID: str = _require("GOOGLE_PROJECT_ID")
 DEFAULT_TIMEZONE: str = os.getenv("DEFAULT_TIMEZONE", "Australia/Sydney")
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
+# Heartbeat / dead-man's-switch (optional). If HEARTBEAT_URL is set, the bot pings
+# it every HEARTBEAT_INTERVAL_MINUTES; an external monitor (healthchecks.io /
+# UptimeRobot) alerts if the pings stop. Leave unset to disable (see heartbeat cog).
+HEARTBEAT_URL: str | None = os.getenv("HEARTBEAT_URL")
+HEARTBEAT_INTERVAL_MINUTES: int = int(os.getenv("HEARTBEAT_INTERVAL_MINUTES", "5"))
+
 # Calendar sync
 CALENDAR_SYNC_INTERVAL: int = int(os.getenv("CALENDAR_SYNC_INTERVAL", "10"))
 CALENDAR_SYNC_DAYS_AHEAD: int = int(os.getenv("CALENDAR_SYNC_DAYS_AHEAD", "30"))

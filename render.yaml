@@ -1,0 +1,62 @@
+# Render Blueprint — rehost of the Ryze Discord bot.
+# See REHOST.md for the full deploy runbook.
+#
+# The bot is a long-running Discord process with NO inbound HTTP, so it deploys as
+# a Background Worker (not a Web Service). The legacy FastAPI (bot/api/) and the
+# nginx + React `web` service in docker-compose.yml are superseded by the CRM
+# (ryze-portal-api on Render + the Vercel frontend) and are deliberately NOT
+# deployed here — this Blueprint runs only the bot + its own Postgres.
+#
+# No code change was needed to be Render-compatible: bot/database.py already
+# normalises a `postgresql://` connection string to the asyncpg driver, and
+# migrations/env.py normalises it to psycopg2 for Alembic and stubs the bot-only
+# env vars, so DATABASE_URL alone is enough to migrate.
+
+services:
+  - type: worker
+    name: ryze-discord-bot
+    runtime: python
+    region: oregon              # co-located with ryze-portal-api to minimise bot->CRM latency
+    plan: starter               # Background Workers need a paid plan (~$7/mo); the free tier is web-only
+    branch: master
+    autoDeploy: false           # owner-gated deploys, mirroring the CRM posture
+    buildCommand: pip install -r requirements.txt
+    # Migrations run at boot and are idempotent; fail-closed (the bot won't start
+    # if the schema can't be brought up to head).
+    startCommand: alembic upgrade head && python -m bot.main
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: ryze-bot-db
+          property: connectionString
+      - key: PORTAL_API_URL
+        value: https://ryze-portal-api.onrender.com
+      - key: DEFAULT_TIMEZONE
+        value: Australia/Sydney
+      - key: LOG_LEVEL
+        value: INFO
+      # ── Secrets — set these in the Render dashboard (sync:false keeps them out of the repo) ──
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: DISCORD_GUILD_ID
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_REFRESH_TOKEN
+        sync: false
+      - key: GOOGLE_PROJECT_ID
+        sync: false
+      # MUST byte-match BOT_API_SECRET on the ryze-portal-api service, or every
+      # bot->CRM sync silently 401s (see DEF-26 in BOT_AUDIT_2026-07-24.md).
+      - key: DASHBOARD_API_KEY
+        sync: false
+      # ── Optional dead-man's-switch heartbeat (see REHOST.md) ──
+      - key: HEARTBEAT_URL
+        sync: false
+
+databases:
+  - name: ryze-bot-db
+    plan: starter               # Starter Postgres persists; the free tier is deleted after 90 days
+    region: oregon
