@@ -88,6 +88,13 @@ class RemindersCog(commands.Cog):
             if not tutor_in_list:
                 members.append(class_group.tutor)
 
+        # No recipients yet (a freshly-hydrated class whose Discord-role enrollment
+        # hasn't populated, or an empty class): skip entirely rather than post a
+        # mention-less reminder and record it as sent — recording would dedup it so
+        # it never re-fires once members are enrolled seconds/minutes later. [DEF-2]
+        if not members:
+            return
+
         # --- Channel reminder ---
         channel_sent = await has_reminder_been_sent(
             session, lesson.id, rtype, ReminderChannel.class_channel

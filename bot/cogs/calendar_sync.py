@@ -22,7 +22,7 @@ from bot.models.class_group import ClassGroup
 from bot.models.lesson import Lesson
 from bot.models.reminder_log import ReminderChannel
 from bot.services.discord_service import safe_send_dm, get_discord_member
-from bot.services.lesson_service import sync_all_calendars_portal as sync_all_calendars
+from bot.services.lesson_service import sync_all_calendars_hydrated as sync_all_calendars
 from bot.services.portal_api import PortalAPIClient
 from bot.services.reminder_service import (
     build_cancellation_dm,
@@ -57,6 +57,11 @@ class CalendarSyncCog(commands.Cog):
             completed = datetime.now(timezone.utc).isoformat()
             log.info("Calendar sync complete: %s", {k: v for k, v in counts.items() if k != "newly_cancelled"})
             await self._handle_cancellations(counts.get("newly_cancelled", []))
+            # New classes were just mirrored locally — enrol their Discord-role
+            # holders now so reminders have recipients before the next fire,
+            # rather than waiting for the members cog's 6-hourly loop. [DEF-2]
+            if counts.get("hydrated_groups_created", 0) > 0:
+                await self._refresh_member_enrollment()
             # Push sync audit log to portal
             if config.DASHBOARD_API_KEY and config.PORTAL_API_URL:
                 async with PortalAPIClient() as client:
@@ -87,6 +92,22 @@ class CalendarSyncCog(commands.Cog):
     @_sync_loop.before_loop
     async def _before_sync(self) -> None:
         await self.bot.wait_until_ready()
+
+    async def _refresh_member_enrollment(self) -> None:
+        """Enrol Discord-role holders into freshly-hydrated class groups now, so
+        reminders/cancellations have recipients before the next fire instead of
+        waiting up to 6 hours for the members cog's own loop. Best-effort."""
+        members_cog = self.bot.cogs.get("MembersCog")
+        if members_cog is None:
+            return
+        guild = self.bot.get_guild(config.DISCORD_GUILD_ID)
+        if guild is None:
+            return
+        try:
+            await members_cog._sync_all_members(guild)
+            log.info("Refreshed member enrollment after hydrating new class group(s).")
+        except Exception:
+            log.exception("Post-hydration member enrollment refresh failed.")
 
     # ── Cancellation notifications ────────────────────────────────────────── #
 
