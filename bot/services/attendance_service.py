@@ -170,12 +170,69 @@ async def close_voice_session(
     return vs
 
 
+async def close_open_sessions_for_lesson(
+    session: AsyncSession, lesson: Lesson, close_at: datetime
+) -> int:
+    """Close every VoiceSession still open for this lesson at ``close_at``,
+    folding each session's minutes into its attendance record.
+
+    A session is still open (``left_at`` is None) when the student is present at
+    lesson end, or when the bot restarted mid-lesson and never saw the leave
+    event. Their minutes have therefore never been accrued, so without this the
+    finalise loop reads ``total_minutes == 0`` and mis-marks a fully-present
+    student ``left_early``/``absent``. Returns the number of sessions closed.
+    """
+    result = await session.execute(
+        select(VoiceSession).where(
+            and_(
+                VoiceSession.lesson_id == lesson.id,
+                VoiceSession.left_at.is_(None),
+            )
+        )
+    )
+    open_sessions = list(result.scalars().all())
+
+    closed = 0
+    for vs in open_sessions:
+        # SQLite returns naive datetimes; normalise to UTC before subtraction.
+        joined = vs.joined_at
+        if joined.tzinfo is None:
+            joined = joined.replace(tzinfo=timezone.utc)
+        # Never credit time before the student joined (guards against a
+        # close_at earlier than joined_at, e.g. clock skew).
+        effective_close = close_at if close_at > joined else joined
+        duration = max(0, int((effective_close - joined).total_seconds() / 60))
+        vs.left_at = effective_close
+        vs.duration_minutes = duration
+
+        record = await get_or_create_attendance_record(session, lesson.id, vs.user_id)
+        record.total_minutes = (record.total_minutes or 0) + duration
+        existing_left = record.left_at
+        if existing_left is not None and existing_left.tzinfo is None:
+            existing_left = existing_left.replace(tzinfo=timezone.utc)
+        if existing_left is None or effective_close > existing_left:
+            record.left_at = effective_close
+        record.updated_at = now_utc()
+        closed += 1
+
+    return closed
+
+
 async def finalise_lesson_attendance(session: AsyncSession, lesson: Lesson) -> int:
     """
     Called at lesson end. Calculates final statuses and creates absent records
     for all enrolled members (students AND tutors) who never joined.
     Returns count of records processed.
     """
+    # Close any sessions still open (student never left, or bot restarted
+    # mid-lesson) so their minutes count before we compute status. Cap the close
+    # time at the lesson end and never credit the future. [DEF-8]
+    end = lesson.end_time
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    close_at = min(now_utc(), end)
+    await close_open_sessions_for_lesson(session, lesson, close_at)
+
     # Get all active enrolled members (students + tutors)
     members_result = await session.execute(
         select(ClassGroupMember).where(

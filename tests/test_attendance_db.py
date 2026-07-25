@@ -9,6 +9,7 @@ from bot.models.class_group import ClassGroup, ClassGroupMember, MemberRole
 from bot.models.lesson import Lesson, LessonStatus
 from bot.models.user import User, UserRole
 from bot.services.attendance_service import (
+    close_open_sessions_for_lesson,
     close_voice_session,
     finalise_lesson_attendance,
     get_or_create_attendance_record,
@@ -236,6 +237,80 @@ class TestFinaliseAttendance:
         record = await _get_attendance(db_session, lesson.id, student.id)
         assert record.status == AttendanceStatus.left_early
 
+    async def test_present_student_still_in_channel_at_end_marked_present(self, db_session):
+        """DEF-8 regression: a student still in voice when the lesson ends has an
+        OPEN session (left_at is None, total_minutes still 0). Finalise must close
+        it and credit the time, marking them present — not left_early."""
+        student = await _make_student(db_session, 666_000_777, "Olivia")
+        group = await _make_group(db_session)
+        now = datetime.now(timezone.utc)
+        # Lesson ran 60 minutes and ended 5 minutes ago; still marked active.
+        lesson = Lesson(
+            class_group_id=group.id,
+            title="Ended lesson",
+            start_time=now - timedelta(minutes=65),
+            end_time=now - timedelta(minutes=5),
+            status=LessonStatus.active,
+        )
+        db_session.add(lesson)
+        await db_session.flush()
+        await _enrol(db_session, group, student)
+
+        # Joins on time and NEVER leaves — the leave event was missed / bot restart.
+        await open_voice_session(
+            db_session, student.discord_user_id, _CHANNEL, lesson, joined_at=lesson.start_time
+        )
+
+        await finalise_lesson_attendance(db_session, lesson)
+
+        record = await _get_attendance(db_session, lesson.id, student.id)
+        assert record.status == AttendanceStatus.present
+        # Credited from join (start) to the lesson end — the full 60 minutes.
+        assert record.total_minutes == 60
+
+        # The dangling open session was closed at the lesson end.
+        vs_result = await db_session.execute(
+            select(VoiceSession).where(VoiceSession.lesson_id == lesson.id)
+        )
+        vs = vs_result.scalar_one()
+        assert vs.left_at is not None
+        assert vs.duration_minutes == 60
+
+    async def test_still_present_after_prior_rejoin_folds_both_segments(self, db_session):
+        """A student who left, rejoined, and is still in the channel at end gets
+        both the closed segment and the still-open segment counted."""
+        student = await _make_student(db_session, 999_000_111, "Rita")
+        group = await _make_group(db_session)
+        now = datetime.now(timezone.utc)
+        lesson = Lesson(
+            class_group_id=group.id,
+            title="Ended lesson",
+            start_time=now - timedelta(minutes=65),
+            end_time=now - timedelta(minutes=5),
+            status=LessonStatus.active,
+        )
+        db_session.add(lesson)
+        await db_session.flush()
+        await _enrol(db_session, group, student)
+        start = lesson.start_time
+
+        # First segment: 20 minutes, closed normally.
+        await open_voice_session(db_session, student.discord_user_id, _CHANNEL, lesson, joined_at=start)
+        await close_voice_session(
+            db_session, student.discord_user_id, _CHANNEL, left_at=start + timedelta(minutes=20)
+        )
+        # Rejoined 25 minutes in and never left.
+        await open_voice_session(
+            db_session, student.discord_user_id, _CHANNEL, lesson, joined_at=start + timedelta(minutes=25)
+        )
+
+        await finalise_lesson_attendance(db_session, lesson)
+
+        record = await _get_attendance(db_session, lesson.id, student.id)
+        # 20 (closed) + 35 (min 25 → end at min 60) = 55 of 60 → present.
+        assert record.total_minutes == 55
+        assert record.status == AttendanceStatus.present
+
     async def test_lesson_status_set_to_completed(self, db_session):
         student = await _make_student(db_session, 444_000_555, "Mia")
         group = await _make_group(db_session)
@@ -264,3 +339,68 @@ class TestFinaliseAttendance:
 
         count = await finalise_lesson_attendance(db_session, lesson)
         assert count == 0
+
+
+# ---------------------------------------------------------------------------
+# close_open_sessions_for_lesson (DEF-8 helper)
+# ---------------------------------------------------------------------------
+
+class TestCloseOpenSessions:
+    async def test_returns_zero_when_no_open_sessions(self, db_session):
+        group = await _make_group(db_session)
+        lesson = await _make_lesson(db_session, group)
+        closed = await close_open_sessions_for_lesson(
+            db_session, lesson, datetime.now(timezone.utc)
+        )
+        assert closed == 0
+
+    async def test_caps_credit_at_close_at_not_beyond(self, db_session):
+        """A still-open session is credited only up to close_at (min(now, end)),
+        never for time the student has not yet been present."""
+        student = await _make_student(db_session, 777_000_888, "Pete")
+        group = await _make_group(db_session)
+        now = datetime.now(timezone.utc)
+        lesson = Lesson(
+            class_group_id=group.id,
+            title="Ongoing lesson",
+            start_time=now - timedelta(minutes=30),
+            end_time=now + timedelta(minutes=30),  # ends in the future
+            status=LessonStatus.active,
+        )
+        db_session.add(lesson)
+        await db_session.flush()
+        await open_voice_session(
+            db_session, student.discord_user_id, _CHANNEL, lesson, joined_at=lesson.start_time
+        )
+
+        # Close mid-lesson at `now`: 30 minutes elapsed, not the 60-min full run.
+        closed = await close_open_sessions_for_lesson(db_session, lesson, now)
+        assert closed == 1
+        record = await _get_attendance(db_session, lesson.id, student.id)
+        assert record.total_minutes == 30
+
+    async def test_close_before_join_credits_zero_not_negative(self, db_session):
+        """If close_at precedes joined_at (clock skew), duration is clamped to 0."""
+        student = await _make_student(db_session, 888_000_999, "Quinn")
+        group = await _make_group(db_session)
+        now = datetime.now(timezone.utc)
+        lesson = Lesson(
+            class_group_id=group.id,
+            title="Lesson",
+            start_time=now - timedelta(minutes=60),
+            end_time=now,
+            status=LessonStatus.active,
+        )
+        db_session.add(lesson)
+        await db_session.flush()
+        # Joined at `now`, but we close at now - 10min.
+        await open_voice_session(
+            db_session, student.discord_user_id, _CHANNEL, lesson, joined_at=now
+        )
+
+        closed = await close_open_sessions_for_lesson(
+            db_session, lesson, now - timedelta(minutes=10)
+        )
+        assert closed == 1
+        record = await _get_attendance(db_session, lesson.id, student.id)
+        assert record.total_minutes == 0
