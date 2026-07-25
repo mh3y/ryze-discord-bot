@@ -153,8 +153,17 @@ async def sync_calendar_for_group(session: AsyncSession, group: ClassGroup) -> d
     if not group.google_calendar_id:
         return {"created": 0, "updated": 0, "cancelled": 0, "skipped": 0, "newly_cancelled": []}
 
-    events = fetch_upcoming_events(
-        group.google_calendar_id, config.CALENDAR_SYNC_DAYS_AHEAD, config.CALENDAR_SYNC_DAYS_BACK
+    # Offload the blocking Google HTTP call to a thread so it can't stall the
+    # asyncio event loop (voice events, heartbeats, job polling) while N calendars
+    # sync one after another. [DEF-10] A Google error now raises (see M11) and is
+    # caught per-group by sync_all_calendars, counting as that group's sync error.
+    events = await asyncio.get_running_loop().run_in_executor(
+        None,
+        lambda: fetch_upcoming_events(
+            group.google_calendar_id,
+            config.CALENDAR_SYNC_DAYS_AHEAD,
+            config.CALENDAR_SYNC_DAYS_BACK,
+        ),
     )
     created = updated = cancelled = skipped = 0
     newly_cancelled: list[Lesson] = []

@@ -65,6 +65,11 @@ services:
         sync: false
       - key: PARENT_ROLE_IDS
         sync: false
+      # Permission-sync grant application. Leave unset/false at launch; the bot
+      # logs but does not apply channel grants until the owner sets this true
+      # after the 7-day soak (revokes always run). See REHOST.md.
+      - key: PERMISSION_SYNC_GRANTS_ENABLED
+        sync: false
 
 databases:
   - name: ryze-bot-db

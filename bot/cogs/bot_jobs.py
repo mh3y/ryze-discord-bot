@@ -184,23 +184,9 @@ class BotJobsCog(commands.Cog):
         # in (or tutoring) that class. Anything else is skipped and logged —
         # a malformed or malicious job must not be able to put a student in a
         # staff channel or an outsider in a minors' class channel.
+        # Always validate the channel is a known active class channel (raises for
+        # an unknown channel) — this guards REVOKES too, not just grants. [DEF-15]
         authorised_grant_ids = await self._authorised_member_ids_for_channel(channel_id)
-
-        # A refused grant is most often a legitimate member whose local
-        # membership row does not exist yet (right after a CRM enrolment, or on
-        # relaunch when the local mirror was rebuilt from Discord state). Run one
-        # member sync and re-validate before giving up, so a real new student is
-        # not silently locked out. [review: job completes 'successfully' when every grant refused]
-        if any(s not in authorised_grant_ids for s in grant_ids):
-            log.info(
-                "[bot_jobs] discord_permission_sync: one or more grants not yet locally "
-                "enrolled — running a member sync and re-validating once."
-            )
-            try:
-                await self._trigger_member_sync()
-            except Exception:
-                log.exception("[bot_jobs] discord_permission_sync: member-sync retry failed (non-fatal).")
-            authorised_grant_ids = await self._authorised_member_ids_for_channel(channel_id)
 
         # Permissions granted to enrolled tutors/students:
         #   view_channel=True, send_messages=True, read_message_history=True
@@ -214,23 +200,52 @@ class BotJobsCog(commands.Cog):
 
         granted = 0
         still_refused: list[int] = []
-        for snowflake in grant_ids:
-            if snowflake not in authorised_grant_ids:
-                still_refused.append(snowflake)
+        if not config.PERMISSION_SYNC_GRANTS_ENABLED:
+            # Grant application is OFF (default until the owner enables it after the
+            # soak). Log what WOULD be granted but apply nothing; revokes below
+            # still run. still_refused stays empty, so the job COMPLETES — a
+            # deliberate config hold is not a failure. [charter grant-flag / soak]
+            if grant_ids:
                 log.warning(
-                    "[bot_jobs] discord_permission_sync: REFUSED grant for %s on #%s — "
-                    "not an active enrolled member/tutor of that class. [DEF-15]",
-                    snowflake, channel,
+                    "[bot_jobs] discord_permission_sync: grant application DISABLED "
+                    "(PERMISSION_SYNC_GRANTS_ENABLED unset) — NOT applying %d grant(s) on #%s; "
+                    "revokes still processed. Enable after the 7-day soak.",
+                    len(grant_ids), channel,
                 )
-                continue
-            member = guild.get_member(snowflake)
-            if member:
-                await channel.set_permissions(member, overwrite=allow_overwrite, reason="CRM discord_permission_sync — enrol")
-                granted += 1
-                log.debug("[bot_jobs] Granted %s access to #%s", member, channel)
-            else:
-                still_refused.append(snowflake)
-                log.warning("[bot_jobs] discord_permission_sync: member %s not in guild — skipping grant.", snowflake)
+        else:
+            # A refused grant is most often a legitimate member whose local
+            # membership row does not exist yet (right after a CRM enrolment, or on
+            # relaunch when the local mirror was rebuilt from Discord state). Run one
+            # member sync and re-validate before giving up, so a real new student is
+            # not silently locked out. [review: job completes 'successfully' when every grant refused]
+            if any(s not in authorised_grant_ids for s in grant_ids):
+                log.info(
+                    "[bot_jobs] discord_permission_sync: one or more grants not yet locally "
+                    "enrolled — running a member sync and re-validating once."
+                )
+                try:
+                    await self._trigger_member_sync()
+                except Exception:
+                    log.exception("[bot_jobs] discord_permission_sync: member-sync retry failed (non-fatal).")
+                authorised_grant_ids = await self._authorised_member_ids_for_channel(channel_id)
+
+            for snowflake in grant_ids:
+                if snowflake not in authorised_grant_ids:
+                    still_refused.append(snowflake)
+                    log.warning(
+                        "[bot_jobs] discord_permission_sync: REFUSED grant for %s on #%s — "
+                        "not an active enrolled member/tutor of that class. [DEF-15]",
+                        snowflake, channel,
+                    )
+                    continue
+                member = guild.get_member(snowflake)
+                if member:
+                    await channel.set_permissions(member, overwrite=allow_overwrite, reason="CRM discord_permission_sync — enrol")
+                    granted += 1
+                    log.debug("[bot_jobs] Granted %s access to #%s", member, channel)
+                else:
+                    still_refused.append(snowflake)
+                    log.warning("[bot_jobs] discord_permission_sync: member %s not in guild — skipping grant.", snowflake)
 
         # Revokes are the SAFE direction (deny access) and legitimately target
         # people who no longer have a membership row (they were just unenrolled),

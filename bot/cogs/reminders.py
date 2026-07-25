@@ -53,24 +53,47 @@ class RemindersCog(commands.Cog):
 
     async def _process_reminders(self, guild: discord.Guild) -> None:
         now = now_utc()
+        # Read the due lessons in one session, then close it. class_group and its
+        # tutor are eager-loaded (selectinload in get_upcoming_lessons), so the
+        # detached lessons are safe to use below.
         async with get_session() as session:
             lessons = await get_upcoming_lessons(session, hours_ahead=25)
 
-            for lesson in lessons:
-                class_group = lesson.class_group
-                # Normalise start_time: SQLite returns naive datetimes; treat as UTC
-                start = lesson.start_time
-                if start.tzinfo is None:
-                    start = start.replace(tzinfo=timezone.utc)
-                for offset in config.REMINDER_OFFSETS_MINUTES:
-                    fire_at = start - timedelta(minutes=offset)
-                    # Fire within the current minute window
-                    if not (fire_at <= now < fire_at + timedelta(minutes=1)):
-                        continue
+        for lesson in lessons:
+            class_group = lesson.class_group
+            # Normalise start_time: SQLite returns naive datetimes; treat as UTC
+            start = lesson.start_time
+            if start.tzinfo is None:
+                start = start.replace(tzinfo=timezone.utc)
+            for offset in config.REMINDER_OFFSETS_MINUTES:
+                fire_at = start - timedelta(minutes=offset)
+                # Fire from fire_at until a catch-up grace elapses, but never past
+                # the lesson start — so a reminder missed during a short outage
+                # still fires on the next tick, yet a stale catch-up never sends
+                # after the lesson has begun. The reminder_log dedup makes
+                # re-firing a no-op. [M2]
+                window_end = min(
+                    fire_at + timedelta(minutes=config.REMINDER_CATCHUP_MINUTES),
+                    start,
+                )
+                if not (fire_at <= now < window_end):
+                    continue
 
-                    rtype = _reminder_type(offset)
-                    await self._send_lesson_reminders(
-                        session, guild, lesson, class_group, offset, rtype
+                rtype = _reminder_type(offset)
+                # Each reminder runs in its OWN session (and commits each send's
+                # dedup row immediately). A failure sending one reminder must not
+                # roll back another reminder's already-delivered dedup rows — that
+                # is what would let the widened catch-up window re-send a message
+                # that was already delivered. [review: M2 duplicate on rollback]
+                try:
+                    async with get_session() as send_session:
+                        await self._send_lesson_reminders(
+                            send_session, guild, lesson, class_group, offset, rtype
+                        )
+                except Exception:
+                    log.exception(
+                        "Reminder send failed (lesson=%s offset=%s) — will retry next tick.",
+                        lesson.id, offset,
                     )
 
     async def _send_lesson_reminders(
@@ -122,10 +145,18 @@ class RemindersCog(commands.Cog):
                 await record_reminder(
                     session, lesson.id, rtype, ReminderChannel.class_channel, success, error_message=error
                 )
+                # Commit the dedup row before moving on, so a delivered channel
+                # post can never be un-recorded by a later failure and re-sent by
+                # the catch-up window. [review: M2 duplicate on rollback]
+                await session.commit()
 
         for db_user in members:
+            # include_failed: a DM that failed (e.g. the member has DMs closed) is
+            # NOT re-attempted on every catch-up tick — try once per window, not
+            # ~30 Forbidden calls. [review: DM retry amplification]
             already_sent = await has_reminder_been_sent(
-                session, lesson.id, rtype, ReminderChannel.dm, user_id=db_user.id
+                session, lesson.id, rtype, ReminderChannel.dm, user_id=db_user.id,
+                include_failed=True,
             )
             if already_sent:
                 continue
@@ -145,6 +176,8 @@ class RemindersCog(commands.Cog):
                 session, lesson.id, rtype, ReminderChannel.dm,
                 success, user_id=db_user.id, error_message=error
             )
+            # Commit each DM's dedup row immediately (same rationale as above).
+            await session.commit()
 
 
 async def setup(bot: commands.Bot) -> None:

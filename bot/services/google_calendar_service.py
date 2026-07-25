@@ -1,5 +1,6 @@
 """Google Calendar API wrapper — fetches and parses calendar events."""
 import logging
+import threading
 from datetime import datetime, timezone, timedelta
 from typing import Any
 
@@ -16,6 +17,14 @@ log = logging.getLogger(__name__)
 
 SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
 
+# Cached OAuth credentials. A token refresh is a network round-trip; the old
+# code refreshed on EVERY calendar fetch (once per class per sync cycle), so a
+# 10-class sync did 10 token exchanges. Cache the Credentials and refresh only
+# when the access token is missing/expired (~once per token lifetime). The lock
+# guards the refresh because fetches are offloaded to executor threads. [M3/DEF-10]
+_creds_lock = threading.Lock()
+_cached_creds: Credentials | None = None
+
 
 def _build_credentials() -> Credentials:
     return Credentials(
@@ -28,9 +37,36 @@ def _build_credentials() -> Credentials:
     )
 
 
+def _get_credentials() -> Credentials:
+    """Return valid credentials, refreshing the access token at most once per
+    token lifetime rather than per calendar fetch. [M3]"""
+    global _cached_creds
+    with _creds_lock:
+        if _cached_creds is None:
+            _cached_creds = _build_credentials()
+        if not _cached_creds.valid:
+            try:
+                _cached_creds.refresh(Request())
+            except Exception:
+                # A failed refresh (e.g. a rotated/revoked refresh token) must not
+                # leave a poisoned cache — drop it so the next call rebuilds, and
+                # surface the error rather than silently returning stale creds.
+                _cached_creds = None
+                raise
+        return _cached_creds
+
+
+def reset_credentials_cache() -> None:
+    """Drop the cached credentials (test/ops helper)."""
+    global _cached_creds
+    with _creds_lock:
+        _cached_creds = None
+
+
 def _get_service():
-    creds = _build_credentials()
-    creds.refresh(Request())
+    # A fresh service is built per call (cheap) from the cached, auto-validated
+    # credentials, so no google-api http object is shared across executor threads.
+    creds = _get_credentials()
     return build("calendar", "v3", credentials=creds, cache_discovery=False)
 
 
@@ -113,8 +149,13 @@ def fetch_upcoming_events(calendar_id: str, days_ahead: int = 30, days_back: int
             .execute()
         )
     except HttpError as exc:
+        # RAISE, don't return [] — a swallowed API error made a failed fetch look
+        # like a calendar with zero events (logged as a successful, empty sync),
+        # so a Google outage silently read as "all lessons gone" for freshness and
+        # the sync-log status. The caller (sync_all_calendars) counts this as that
+        # group's error and moves on; the 14-day lookback backfills next cycle. [M11]
         log.error("Google Calendar API error for %s (HttpError): %s", calendar_id, exc)
-        return []
+        raise
     except Exception as exc:
         # Catches google.auth.exceptions.RefreshError, TransportError, etc.
         log.error("Google Calendar API error for %s (%s): %s", calendar_id, type(exc).__name__, exc)

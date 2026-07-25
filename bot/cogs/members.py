@@ -285,6 +285,29 @@ class MembersCog(commands.Cog):
                         db_user.role = portal_role
                         local_role_by_discord_id[member.id] = portal_role
 
+                db_user_id = discord_to_db_id[member.id]
+                member_role_ids = {r.id for r in member.roles}
+
+                # ── L2 PII-push gating ────────────────────────────────────
+                # Only push people actually part of the tutoring operation:
+                # positively-classified staff/tutor, OR a member enrolled in ≥1
+                # class (holds a mapped class role, or already has an active
+                # membership). An unclassified server-joiner with no class — a
+                # parent's second account, a prospective family, a community
+                # member, a lurker — must NOT be filed in the CRM as a "student";
+                # that accumulates minors-adjacent PII the CRM has no basis to
+                # hold and corrupts the student roster. The LOCAL mirror still
+                # records everyone (rebuildable cache); only the CRM push is
+                # gated. A member becomes eligible the moment they get a class
+                # role (auto-enrolled → pushed), which is also exactly when their
+                # voice attendance needs a CRM user to match against. [L2]
+                is_staff_or_tutor = portal_role in (UserRole.admin, UserRole.tutor)
+                holds_class_role = any(
+                    g.discord_role_id in member_role_ids for g in role_mapped_groups
+                )
+                already_enrolled = any(uid == db_user_id for (uid, _gid) in enrolled_pairs)
+                eligible_for_push = is_staff_or_tutor or holds_class_role or already_enrolled
+
                 # ── Build the portal payload entry ────────────────────────
                 # Withheld entirely when classification is unconfigured (fail
                 # closed — the CRM writes `role` unconditionally, so any push
@@ -295,7 +318,8 @@ class MembersCog(commands.Cog):
                 # A soft-deactivated user (via /delete_user) must not be re-pushed
                 # to the CRM as a current member — the bot would silently resurrect
                 # the account it just deactivated. [review: deactivated users still pushed]
-                if classification_on and not demote_hold and portal_role != UserRole.parent and user_is_active:
+                if (classification_on and not demote_hold and portal_role != UserRole.parent
+                        and user_is_active and eligible_for_push):
                     avatar = str(member.display_avatar.url) if member.display_avatar else None
                     portal_members.append({
                         "discord_user_id": str(member.id),
@@ -303,9 +327,6 @@ class MembersCog(commands.Cog):
                         "avatar_url":      avatar,
                         "role":            portal_role.value,
                     })
-
-                db_user_id = discord_to_db_id[member.id]
-                member_role_ids = {r.id for r in member.roles}
 
                 # Do not silently re-enrol a soft-deactivated user just because
                 # they still hold a mapped Discord role — that would reverse the
@@ -425,14 +446,37 @@ class MembersCog(commands.Cog):
                 member, member.id, portal_role.value,
             )
 
-        # Push to portal API — same fail-closed rules as the bulk sync [DEF-16]:
-        # no push at all when role classification is unconfigured, and parents
-        # are never pushed as students.
+            # L2: apply the SAME push-eligibility gate as the bulk sync, or the
+            # listener would file every server-joiner in the CRM as a student the
+            # instant they join — nullifying L2 for the primary runtime path. Only
+            # push someone who is part of the tutoring operation: classified
+            # staff/tutor, or already holding a mapped class role. A joiner with
+            # neither is recorded locally only; they become CRM-visible when they
+            # get a class role (the next bulk sync picks them up). [review: on_member_join bypassed L2]
+            eligible_for_push = portal_role in (UserRole.admin, UserRole.tutor)
+            if not eligible_for_push:
+                member_role_ids = {r.id for r in member.roles}
+                if member_role_ids:
+                    class_role_hit = await session.execute(
+                        select(ClassGroup.id).where(
+                            and_(
+                                ClassGroup.active.is_(True),
+                                ClassGroup.discord_role_id.in_(member_role_ids),
+                            )
+                        ).limit(1)
+                    )
+                    eligible_for_push = class_role_hit.scalar_one_or_none() is not None
+
+        # Push to portal API — same fail-closed + eligibility rules as the bulk
+        # sync [DEF-16 + L2]: no push when classification is unconfigured, parents
+        # are never pushed as students, and unclassified/unenrolled joiners are
+        # withheld from the CRM.
         if (
             config.DASHBOARD_API_KEY
             and config.PORTAL_API_URL
             and config.role_classification_configured()
             and portal_role != UserRole.parent
+            and eligible_for_push
         ):
             try:
                 avatar = str(member.display_avatar.url) if member.display_avatar else None
@@ -449,6 +493,12 @@ class MembersCog(commands.Cog):
             log.warning(
                 "[members] on_member_join: role IDs unconfigured — %s (%d) recorded "
                 "locally only, NOT pushed to the CRM (fail-closed).",
+                member.display_name, member.id,
+            )
+        elif not eligible_for_push:
+            log.debug(
+                "[members] on_member_join: %s (%d) is not staff/tutor and holds no class "
+                "role — recorded locally only, not pushed to the CRM (L2).",
                 member.display_name, member.id,
             )
 

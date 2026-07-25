@@ -43,6 +43,7 @@ and are deliberately **not** deployed. They can be deleted in a later tidy-up.
    | `STAFF_ROLE_IDS` | comma-separated Discord role IDs whose holders are CRM **admins**. UNSET = fail-closed: nobody classifies as staff and NO member data is pushed to the CRM |
    | `TUTOR_ROLE_IDS` | comma-separated Discord role IDs whose holders are CRM **tutors** |
    | `PARENT_ROLE_IDS` | comma-separated Discord role IDs for **parents** (recorded locally, never pushed as students) |
+   | `PERMISSION_SYNC_GRANTS_ENABLED` | leave **unset/false at launch**. While off, the bot logs what it would grant on class channels but applies nothing (revokes still run). Set to `true` only after the 7-day soak (checklist box 12). |
 
    `DATABASE_URL`, `PORTAL_API_URL`, `DEFAULT_TIMEZONE`, `LOG_LEVEL` are set by the
    Blueprint automatically.
@@ -86,12 +87,40 @@ deploy candidate branch — verify they're merged beneath the tip you deploy);
    — or the owner explicitly accepts the fail-closed default (no CRM member sync).
 10. ☐ **DM policy applied** in Discord server settings (no unmonitored 1:1
     adult↔minor contact; tuition communication in class channels).
-11. ☐ **Supervised smoke window** after first boot: startup-probe PASS lines,
-    first calendar sync succeeds, heartbeat monitor green, one test reminder,
-    portal push 200s.
+11. ☐ **Supervised smoke window** after first boot — see the runbook below.
 12. ☐ **7-day soak** before enabling permission-sync grant application or
     starting any new feature wave: no loop-crash logs, heartbeat green, sync
-    logs honest.
+    logs honest. Only then set `PERMISSION_SYNC_GRANTS_ENABLED=true`.
+
+## Supervised smoke window (checklist box 11 — first ~30 min after boot)
+
+Watch the worker logs and Discord side-by-side. Confirm, in order:
+
+1. **Startup health block** — `RYZE EDUCATION BOT — STARTUP HEALTH CHECK` with all ✓,
+   then the startup probe lines (M9): DB `SELECT 1` OK (a failure here aborts boot —
+   fail-closed), portal `get_classes` reachable, Google credentials refresh OK.
+   Then `Ryze Education Bot ready` and the bot shows **online** in Discord.
+2. **First calendar sync** (within `CALENDAR_SYNC_INTERVAL`, default 10 min) — log
+   line `Calendar sync complete: …` with `errors=0`, and classes/lessons appear.
+   A Google error now RAISES and is counted (M11), so `errors>0` here means a real
+   Google problem to fix, not a silent empty sync.
+3. **Heartbeat monitor green** — the external check (healthchecks.io/UptimeRobot)
+   receives pings; it goes red only if the gateway drops or a sync goes stale (M8).
+4. **Member sync** — if role IDs are set, a `Portal member sync complete: …` line;
+   confirm in the CRM that only real students/staff appear (L2 — unclassified
+   server-joiners are deliberately NOT pushed). If role IDs are unset you'll see the
+   loud fail-closed warning instead (expected).
+5. **One test reminder** — schedule a lesson a few minutes out on a class calendar
+   and confirm the DM + channel reminder fire (a reminder missed during a brief
+   restart now catches up within `REMINDER_CATCHUP_MINUTES`, default 30 — M2).
+6. **A real class run** records voice attendance in the CRM (the bot's most
+   important job).
+7. **Permission-sync** — with `PERMISSION_SYNC_GRANTS_ENABLED` still unset, trigger
+   a class Discord-permission sync from the CRM and confirm the log says grants are
+   DISABLED (applied nothing) while revokes still process. This proves the soak
+   posture before you flip the flag.
+
+If any step fails, the deploy is not "green" — stop and diagnose before the soak clock starts.
 
 ## Known follow-ups (not blockers for coming back online)
 

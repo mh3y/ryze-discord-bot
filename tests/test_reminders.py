@@ -72,6 +72,26 @@ class TestReminderDeduplication:
         assert sent is False
 
     @pytest.mark.asyncio
+    async def test_include_failed_counts_failed_attempt(self, db_session):
+        """include_failed=True treats a failed DM as 'already tried', so a member
+        with DMs closed is not retried on every catch-up tick. [review: DM retry]"""
+        await record_reminder(
+            db_session, lesson_id=77, reminder_type="1h",
+            channel=ReminderChannel.dm, success=False, user_id=7,
+            error_message="DM blocked"
+        )
+        # default: retryable (not counted)
+        assert await has_reminder_been_sent(
+            db_session, lesson_id=77, reminder_type="1h",
+            channel=ReminderChannel.dm, user_id=7,
+        ) is False
+        # include_failed: counted → not retried again this window
+        assert await has_reminder_been_sent(
+            db_session, lesson_id=77, reminder_type="1h",
+            channel=ReminderChannel.dm, user_id=7, include_failed=True,
+        ) is True
+
+    @pytest.mark.asyncio
     async def test_different_reminder_types_are_independent(self, db_session):
         await record_reminder(
             db_session, lesson_id=3, reminder_type="24h",

@@ -33,13 +33,22 @@ async def has_reminder_been_sent(
     reminder_type: str,
     channel: ReminderChannel,
     user_id: Optional[int] = None,
+    include_failed: bool = False,
 ) -> bool:
+    """True if a reminder row exists for this (lesson, type, channel[, user]).
+
+    By default only a SUCCESSFUL send counts (so a transient failure is retried).
+    Pass ``include_failed=True`` to also count a failed attempt as "already tried"
+    — used for DMs so a member with DMs closed (permanent Forbidden) is not
+    re-attempted on every catch-up tick across the reminder window. [review]
+    """
     conditions = [
         ReminderLog.lesson_id == lesson_id,
         ReminderLog.reminder_type == reminder_type,
         ReminderLog.channel == channel,
-        ReminderLog.success.is_(True),
     ]
+    if not include_failed:
+        conditions.append(ReminderLog.success.is_(True))
     if user_id is not None:
         conditions.append(ReminderLog.user_id == user_id)
     else:

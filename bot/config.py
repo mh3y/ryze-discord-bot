@@ -75,8 +75,24 @@ CALENDAR_SYNC_DAYS_AHEAD: int = int(os.getenv("CALENDAR_SYNC_DAYS_AHEAD", "30"))
 # lookback so past lessons missed during an outage are backfilled to the portal.
 CALENDAR_SYNC_DAYS_BACK: int = int(os.getenv("CALENDAR_SYNC_DAYS_BACK", "14"))
 
+# Permission-sync GRANT application master switch. Grants (adding view/send on a
+# class channel) start OFF at relaunch and are enabled by the owner only after
+# the 7-day soak (no loop deaths, honest logs). While OFF the bot logs what it
+# WOULD grant but applies nothing; REVOKES (the safe deny direction) always run
+# so access can still be removed. [charter grant-flag / soak]
+PERMISSION_SYNC_GRANTS_ENABLED: bool = os.getenv(
+    "PERMISSION_SYNC_GRANTS_ENABLED", "false"
+).strip().lower() in ("1", "true", "yes", "on")
+
 # Reminder offsets in minutes before lesson start
 REMINDER_OFFSETS_MINUTES: list[int] = [24 * 60, 60, 15]
+# Catch-up grace after a reminder's fire time. The loop runs every minute; a
+# strict 1-minute window means a reminder is lost forever if the bot is down for
+# that exact minute (a Render deploy, a crash-restart). This widens the window so
+# a reminder missed during a short outage still fires on the next tick — the
+# reminder_log dedup guarantees it never double-sends, and firing is still capped
+# at the lesson start so a late catch-up never sends after the lesson began. [M2]
+REMINDER_CATCHUP_MINUTES: int = int(os.getenv("REMINDER_CATCHUP_MINUTES", "30"))
 
 # Attendance thresholds
 ATTENDANCE_PRESENT_THRESHOLD: float = 0.70

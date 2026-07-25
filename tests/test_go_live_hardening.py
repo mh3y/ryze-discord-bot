@@ -75,6 +75,12 @@ def _perm_channel(channel_id: int = _CHANNEL_ID):
 
 
 class TestPermissionSyncValidation:
+    @pytest.fixture(autouse=True)
+    def _grants_on(self, monkeypatch):
+        # These tests exercise the GRANT path; enable it (production default is
+        # OFF until the owner flips it after the soak — see TestGrantFlag). [Inc-1b]
+        monkeypatch.setattr(config, "PERMISSION_SYNC_GRANTS_ENABLED", True)
+
     async def test_unknown_channel_rejected(self, db_session):
         """A channel with no matching class group must never have permissions
         applied — the job fails loudly instead. [DEF-15]"""
@@ -324,9 +330,16 @@ class TestSyncAllMembersFailClosed:
         monkeypatch.setattr(config, "TUTOR_ROLE_IDS", frozenset({200}))
         monkeypatch.setattr(config, "PARENT_ROLE_IDS", frozenset({300}))
 
+        # A class with a mapped Discord role, so an ENROLLED student is eligible to
+        # push (L2 gates only unclassified, unenrolled joiners — a plain student
+        # holding no class role is NOT pushed; that case is TestPIIPushGating).
+        group = ClassGroup(name="Y11", discord_text_channel_id=555, discord_role_id=900, active=True)
+        db_session.add(group)
+        await db_session.flush()
+
         staff = _member_with_role_ids(100, discord_id=6002, name="Staff")
         parent = _member_with_role_ids(300, discord_id=6003, name="Parent")
-        student = _member_with_role_ids(discord_id=6004, name="Student")
+        student = _member_with_role_ids(900, discord_id=6004, name="Student")  # holds class role → enrolled
         guild = make_guild(members=[staff, parent, student])
         cog = _make_members_cog(guild)
         with session_patch("bot.cogs.members", db_session):
@@ -503,6 +516,10 @@ class TestSoftDeactivateUser:
 
 class TestReviewFixesPermissionSync:
     """DEF-15 hardening surfaced by the Increment-1 adversarial review."""
+
+    @pytest.fixture(autouse=True)
+    def _grants_on(self, monkeypatch):
+        monkeypatch.setattr(config, "PERMISSION_SYNC_GRANTS_ENABLED", True)
 
     async def test_grant_applies_after_member_sync_retry(self, db_session):
         """A grant refused on the first pass but enrolled by the member-sync
@@ -768,3 +785,291 @@ class TestReviewFixesHeartbeatFreshness:
         # bot reads as stale and the dead-man's-switch is allowed to fire.
         assert health._last_sync_ok_at is None
         assert health.is_fresh(30) is False
+
+
+# ===========================================================================
+# Increment 1b — sync reliability + privacy + deploy-safety
+# ===========================================================================
+
+class TestGrantFlag:
+    """PERMISSION_SYNC_GRANTS_ENABLED default-off: grants held, revokes still run."""
+
+    async def test_grants_not_applied_when_flag_off(self, db_session, monkeypatch):
+        monkeypatch.setattr(config, "PERMISSION_SYNC_GRANTS_ENABLED", False)
+        channel = _perm_channel()
+        member = make_member(8001)
+        guild = make_guild(channels=[channel], members=[member])
+        cog = _make_jobs_cog(guild)
+        cog._trigger_member_sync = AsyncMock()
+
+        group = await _make_class_with_channel(db_session)
+        user = await _make_user(db_session, 8001)
+        await _enrol(db_session, group, user)  # genuinely enrolled — would grant if enabled
+
+        with session_patch("bot.cogs.bot_jobs", db_session):
+            await cog._trigger_discord_permission_sync(
+                {"channel_id": str(_CHANNEL_ID), "grant_discord_ids": ["8001"]}
+            )
+        # Grant NOT applied (flag off); job completes without raising; no member sync.
+        channel.set_permissions.assert_not_called()
+        cog._trigger_member_sync.assert_not_awaited()
+
+    async def test_revokes_still_apply_when_flag_off(self, db_session, monkeypatch):
+        monkeypatch.setattr(config, "PERMISSION_SYNC_GRANTS_ENABLED", False)
+        channel = _perm_channel()
+        normal = make_member(8002)
+        normal.guild_permissions = MagicMock(administrator=False)
+        guild = make_guild(channels=[channel], members=[normal])
+        guild.owner = None
+        cog = _make_jobs_cog(guild)
+
+        await _make_class_with_channel(db_session)  # channel IS a class channel
+
+        with session_patch("bot.cogs.bot_jobs", db_session):
+            await cog._trigger_discord_permission_sync(
+                {"channel_id": str(_CHANNEL_ID), "revoke_discord_ids": ["8002"]}
+            )
+        channel.set_permissions.assert_awaited_once()  # revoke applied even with grants off
+
+    async def test_unknown_channel_rejected_even_for_revoke_with_flag_off(self, db_session, monkeypatch):
+        """The channel is validated regardless of the grant flag, so a revoke to
+        an unknown channel still fails-closed."""
+        monkeypatch.setattr(config, "PERMISSION_SYNC_GRANTS_ENABLED", False)
+        channel = _perm_channel()
+        guild = make_guild(channels=[channel], members=[make_member(8003)])
+        cog = _make_jobs_cog(guild)
+        # no class group for this channel → unknown
+
+        with session_patch("bot.cogs.bot_jobs", db_session):
+            with pytest.raises(RuntimeError, match="not a known active"):
+                await cog._trigger_discord_permission_sync(
+                    {"channel_id": str(_CHANNEL_ID), "revoke_discord_ids": ["8003"]}
+                )
+        channel.set_permissions.assert_not_called()
+
+
+class TestPIIPushGating:
+    """L2: the CRM must not accumulate PII of unclassified, unenrolled joiners."""
+
+    @pytest.fixture(autouse=True)
+    def _portal_env(self, monkeypatch):
+        monkeypatch.setattr(config, "DASHBOARD_API_KEY", "k")
+        monkeypatch.setattr(config, "PORTAL_API_URL", "https://portal.example")
+        monkeypatch.setattr("bot.cogs.members.PortalAPIClient", _FakePortalClient)
+        monkeypatch.setattr(config, "STAFF_ROLE_IDS", frozenset({100}))
+        monkeypatch.setattr(config, "TUTOR_ROLE_IDS", frozenset({200}))
+        monkeypatch.setattr(config, "PARENT_ROLE_IDS", frozenset({300}))
+        monkeypatch.setattr(config, "ADMIN_NOTIFICATION_CHANNEL_ID", None)  # _notify_admin no-op
+        _FakePortalClient.pushed = []
+
+    @staticmethod
+    def _join_member(discord_id: int, *role_ids: int):
+        m = make_member(discord_id)
+        m.roles = [make_role(rid, f"r{rid}") for rid in role_ids]
+        m.display_avatar = MagicMock()  # so on_member_join's thumbnail=.url works
+        m.bot = False
+        return m
+
+    # ── bulk _sync_all_members path ──
+    async def test_unclassified_unenrolled_member_not_pushed(self, db_session):
+        # No configured role, no class role → student by fallthrough, NOT enrolled.
+        guild = make_guild(members=[_member_with_role_ids(discord_id=8100)])
+        cog = _make_members_cog(guild)
+        with session_patch("bot.cogs.members", db_session):
+            created, _ = await cog._sync_all_members(guild)
+        assert created == 1  # local record still made (rebuildable cache)
+        pushed_ids = [p["discord_user_id"] for batch in _FakePortalClient.pushed for p in batch]
+        assert "8100" not in pushed_ids  # but NOT filed in the CRM
+
+    async def test_enrolled_student_is_pushed(self, db_session):
+        group = ClassGroup(name="Y12", discord_text_channel_id=556, discord_role_id=901, active=True)
+        db_session.add(group)
+        await db_session.flush()
+        guild = make_guild(members=[_member_with_role_ids(901, discord_id=8101)])  # holds class role
+        cog = _make_members_cog(guild)
+        with session_patch("bot.cogs.members", db_session):
+            await cog._sync_all_members(guild)
+        pushed_ids = [p["discord_user_id"] for batch in _FakePortalClient.pushed for p in batch]
+        assert "8101" in pushed_ids  # enrolled → pushed (and its attendance can match)
+
+    async def test_staff_pushed_without_class(self, db_session):
+        guild = make_guild(members=[_member_with_role_ids(100, discord_id=8102)])  # staff, no class
+        cog = _make_members_cog(guild)
+        with session_patch("bot.cogs.members", db_session):
+            await cog._sync_all_members(guild)
+        pushed = {p["discord_user_id"]: p["role"] for batch in _FakePortalClient.pushed for p in batch}
+        assert pushed.get("8102") == "admin"  # staff pushed regardless of enrolment
+
+    # ── on_member_join listener must apply the SAME L2 gate [review: bypass] ──
+    async def test_join_unclassified_not_pushed(self, db_session):
+        cog = _make_members_cog(make_guild())
+        member = self._join_member(8200)  # no configured role, no class role
+        with session_patch("bot.cogs.members", db_session):
+            await cog.on_member_join(member)
+        # local record made, but NOT pushed to the CRM
+        from sqlalchemy import select
+        assert (await db_session.execute(
+            select(User).where(User.discord_user_id == 8200)
+        )).scalar_one_or_none() is not None
+        pushed_ids = [p["discord_user_id"] for batch in _FakePortalClient.pushed for p in batch]
+        assert "8200" not in pushed_ids
+
+    async def test_join_staff_pushed(self, db_session):
+        cog = _make_members_cog(make_guild())
+        member = self._join_member(8201, 100)  # STAFF role
+        with session_patch("bot.cogs.members", db_session):
+            await cog.on_member_join(member)
+        pushed = {p["discord_user_id"]: p["role"] for batch in _FakePortalClient.pushed for p in batch}
+        assert pushed.get("8201") == "admin"
+
+    async def test_join_with_class_role_pushed(self, db_session):
+        group = ClassGroup(name="Y10", discord_text_channel_id=557, discord_role_id=902, active=True)
+        db_session.add(group)
+        await db_session.flush()
+        cog = _make_members_cog(make_guild())
+        member = self._join_member(8202, 902)  # holds a mapped class role
+        with session_patch("bot.cogs.members", db_session):
+            await cog.on_member_join(member)
+        pushed_ids = [p["discord_user_id"] for batch in _FakePortalClient.pushed for p in batch]
+        assert "8202" in pushed_ids
+
+
+class TestReminderCatchup:
+    """M2: a reminder missed during a short outage catches up; never after start."""
+
+    def _make_reminders_cog(self):
+        from bot.cogs.reminders import RemindersCog
+        bot = make_bot()
+        guild = make_guild()
+        bot.get_guild = MagicMock(return_value=guild)
+        cog = RemindersCog(bot)
+        cog._reminder_loop.cancel()
+        return cog, guild
+
+    async def _run(self, cog, guild, db_session, monkeypatch, lesson):
+        sent: list[int] = []
+
+        async def fake_send(session, guild_, lesson_, cg, offset, rtype):
+            sent.append(offset)
+
+        cog._send_lesson_reminders = fake_send
+
+        async def fake_upcoming(session, hours_ahead):
+            return [lesson]
+
+        monkeypatch.setattr("bot.cogs.reminders.get_upcoming_lessons", fake_upcoming)
+        with session_patch("bot.cogs.reminders", db_session):
+            await cog._process_reminders(guild)
+        return sent
+
+    async def test_missed_minute_still_fires_within_catchup(self, db_session, monkeypatch):
+        from datetime import datetime, timezone, timedelta
+        monkeypatch.setattr(config, "REMINDER_OFFSETS_MINUTES", [60])
+        monkeypatch.setattr(config, "REMINDER_CATCHUP_MINUTES", 30)
+        cog, guild = self._make_reminders_cog()
+        # start in 45 min → the 60-min reminder's fire_at was 15 min ago (missed its
+        # exact minute), 15 < 30 catch-up and now < start → should still fire.
+        lesson = MagicMock()
+        lesson.start_time = datetime.now(timezone.utc) + timedelta(minutes=45)
+        lesson.class_group = MagicMock()
+        sent = await self._run(cog, guild, db_session, monkeypatch, lesson)
+        assert sent == [60]
+
+    async def test_not_fired_after_lesson_start(self, db_session, monkeypatch):
+        from datetime import datetime, timezone, timedelta
+        monkeypatch.setattr(config, "REMINDER_OFFSETS_MINUTES", [15])
+        monkeypatch.setattr(config, "REMINDER_CATCHUP_MINUTES", 30)
+        cog, guild = self._make_reminders_cog()
+        # lesson already started 5 min ago → window_end is capped at start (past) → no fire.
+        lesson = MagicMock()
+        lesson.start_time = datetime.now(timezone.utc) - timedelta(minutes=5)
+        lesson.class_group = MagicMock()
+        sent = await self._run(cog, guild, db_session, monkeypatch, lesson)
+        assert sent == []
+
+    async def test_far_future_reminder_not_yet_due(self, db_session, monkeypatch):
+        from datetime import datetime, timezone, timedelta
+        monkeypatch.setattr(config, "REMINDER_OFFSETS_MINUTES", [60])
+        monkeypatch.setattr(config, "REMINDER_CATCHUP_MINUTES", 30)
+        cog, guild = self._make_reminders_cog()
+        # start in 3h → the 60-min reminder isn't due for ~2h → must not fire early.
+        lesson = MagicMock()
+        lesson.start_time = datetime.now(timezone.utc) + timedelta(hours=3)
+        lesson.class_group = MagicMock()
+        sent = await self._run(cog, guild, db_session, monkeypatch, lesson)
+        assert sent == []
+
+    async def test_one_reminder_failure_does_not_block_others(self, db_session, monkeypatch):
+        """Per-reminder session isolation: a failure sending one lesson's reminder
+        must not abort the batch (which is what let the widened window re-send an
+        already-delivered reminder). [review: M2 duplicate on rollback]"""
+        from datetime import datetime, timezone, timedelta
+        monkeypatch.setattr(config, "REMINDER_OFFSETS_MINUTES", [60])
+        monkeypatch.setattr(config, "REMINDER_CATCHUP_MINUTES", 30)
+        cog, guild = self._make_reminders_cog()
+        start = datetime.now(timezone.utc) + timedelta(minutes=45)
+        lesson_a = MagicMock(id=1, start_time=start, class_group=MagicMock())
+        lesson_b = MagicMock(id=2, start_time=start, class_group=MagicMock())
+
+        processed: list[int] = []
+
+        async def flaky_send(session, guild_, lesson_, cg, offset, rtype):
+            processed.append(lesson_.id)
+            if lesson_.id == 1:
+                raise RuntimeError("transient DB blip")
+
+        cog._send_lesson_reminders = flaky_send
+
+        async def fake_upcoming(session, hours_ahead):
+            return [lesson_a, lesson_b]
+
+        monkeypatch.setattr("bot.cogs.reminders.get_upcoming_lessons", fake_upcoming)
+        with session_patch("bot.cogs.reminders", db_session):
+            await cog._process_reminders(guild)
+        assert processed == [1, 2]  # A raised, B still processed
+
+
+class TestGoogleReliability:
+    """M11 (fail loud, not empty-success) + M3 (credential caching)."""
+
+    def test_fetch_raises_on_httperror(self, monkeypatch):
+        from bot.services import google_calendar_service as gcs
+        from googleapiclient.errors import HttpError
+
+        resp = type("R", (), {"status": 500, "reason": "boom"})()
+        err = HttpError(resp, b'{"error": "boom"}')
+
+        def _boom():
+            raise err
+
+        monkeypatch.setattr(gcs, "_get_service", _boom)
+        # RAISE (fail loud), not return [] — a swallowed error read as an empty sync.
+        with pytest.raises(HttpError):
+            gcs.fetch_upcoming_events("cal@example.com")
+
+    def test_credentials_cached_and_refreshed_once(self, monkeypatch):
+        from bot.services import google_calendar_service as gcs
+
+        gcs.reset_credentials_cache()
+        refreshes = {"n": 0}
+
+        class _FakeCreds:
+            def __init__(self):
+                self._valid = False
+
+            @property
+            def valid(self):
+                return self._valid
+
+            def refresh(self, _req):
+                refreshes["n"] += 1
+                self._valid = True
+
+        monkeypatch.setattr(gcs, "_build_credentials", lambda: _FakeCreds())
+        try:
+            c1 = gcs._get_credentials()
+            c2 = gcs._get_credentials()
+            assert c1 is c2                # same cached object reused
+            assert refreshes["n"] == 1     # refreshed once, not per fetch
+        finally:
+            gcs.reset_credentials_cache()
