@@ -46,10 +46,6 @@ import logging
 import re
 from datetime import datetime, timezone
 
-# Matches any email address (used to detect the primary Google account calendar
-# whose calendar ID is always the account's email, e.g. "ryzeeducationhq@gmail.com").
-_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-
 import discord
 from discord import app_commands, Interaction
 from discord.ext import commands, tasks
@@ -109,12 +105,14 @@ def _should_skip(calendar: dict) -> bool:
         return True
     if SKIP_UNDERSCORE_PREFIX and name.startswith("_"):
         return True
-    # Skip the primary Google account calendar. Its calendar ID is always the
-    # account's own email address (e.g. "ryzeeducationhq@gmail.com"), which is
-    # never a real class calendar and must not be auto-provisioned as one.
-    cal_id = calendar.get("id", "")
-    if _EMAIL_RE.match(cal_id):
-        log.debug("Skipping primary account calendar (email-format ID): %r", cal_id)
+    # Skip the account's PRIMARY calendar — it is never a real class calendar and
+    # must not be auto-provisioned as a ghost class. Use Google's authoritative
+    # `primary` flag from list_calendars, NOT an email-shaped-ID heuristic: every
+    # secondary class calendar ALSO has an email-shaped ID
+    # (…@group.calendar.google.com), so matching that shape skips every real
+    # class and breaks auto-provisioning entirely. [DEF-9]
+    if calendar.get("primary"):
+        log.debug("Skipping primary account calendar: %r", calendar.get("id", ""))
         return True
     name_lower = name.lower()
     for ignored in IGNORED_CALENDAR_NAMES:
