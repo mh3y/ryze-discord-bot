@@ -30,6 +30,7 @@ from bot.services.lesson_service import (
 )
 from bot.services.portal_api import PortalAPIClient
 from bot.utils.time_utils import SYDNEY_TZ, format_sydney, now_utc
+from bot.utils.task_safety import install_loop_restart
 
 log = logging.getLogger(__name__)
 
@@ -255,6 +256,7 @@ def _build_voice_embed(
 class AttendanceCog(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+        install_loop_restart(self._finalise_loop, "attendance.finalise", self.bot)
         self._finalise_loop.start()
 
     def cog_unload(self) -> None:

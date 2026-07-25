@@ -399,11 +399,12 @@ async def sync_all_calendars() -> dict:
     retain their data (``expire_on_commit=False``).  Callers can use this list
     to fire Discord cancellation notifications.
     """
-    totals: dict = {"created": 0, "updated": 0, "cancelled": 0, "skipped": 0, "errors": 0, "newly_cancelled": []}
+    totals: dict = {"created": 0, "updated": 0, "cancelled": 0, "skipped": 0, "errors": 0, "groups_total": 0, "newly_cancelled": []}
     synced_groups: list[ClassGroup] = []
 
     async with get_session() as session:
         groups = await get_active_class_groups(session)
+        totals["groups_total"] = len(groups)
         for group in groups:
             try:
                 counts = await sync_calendar_for_group(session, group)

@@ -31,6 +31,7 @@ from bot.database import get_session
 from bot.models.class_group import ClassGroup, ClassGroupMember, MemberRole
 from bot.models.user import User, UserRole
 from bot.services.portal_api import PortalAPIClient, PortalAPIError
+from bot.utils.task_safety import install_loop_restart
 
 log = logging.getLogger(__name__)
 
@@ -92,6 +93,7 @@ async def _set_nickname(member: discord.Member, full_name: str) -> str:
 class MembersCog(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+        install_loop_restart(self._sync_loop, "members.sync", self.bot)
         self._sync_loop.start()
 
     def cog_unload(self) -> None:
@@ -124,15 +126,23 @@ class MembersCog(commands.Cog):
     @staticmethod
     def _detect_portal_role(member: discord.Member) -> UserRole:
         """
-        Determine the portal role for a Discord member by checking which of the
-        three base roles they hold.  Priority: Admin > Tutor > Student.
-        Returns UserRole.student if none of the base roles are found.
+        Classify a Discord member by EXPLICITLY CONFIGURED ROLE IDs, never by
+        role name. [DEF-16] A role literally named "Admin" is creatable by anyone
+        with Manage Roles and must never grant CRM privileges; the configured IDs
+        (STAFF_ROLE_IDS / TUTOR_ROLE_IDS / PARENT_ROLE_IDS env vars) are pinned
+        by the owner and cannot be minted from inside the guild.
+
+        Priority: staff > tutor > parent > student. When no IDs are configured
+        this returns student for everyone (fail closed) and _sync_all_members
+        additionally refuses to push ANY role data to the CRM.
         """
-        member_role_names = {r.name.lower() for r in member.roles}
-        if "admin" in member_role_names:
+        member_role_ids = {r.id for r in member.roles}
+        if member_role_ids & config.STAFF_ROLE_IDS:
             return UserRole.admin
-        if "tutor" in member_role_names:
+        if member_role_ids & config.TUTOR_ROLE_IDS:
             return UserRole.tutor
+        if member_role_ids & config.PARENT_ROLE_IDS:
+            return UserRole.parent
         return UserRole.student
 
     # ── Full member sync ──────────────────────────────────────────────────── #
@@ -146,10 +156,48 @@ class MembersCog(commands.Cog):
         • Pushes the full member snapshot to the portal API (Supabase).
         Returns (new_records_created, new_enrolments_created).
         """
+        # Fail-closed role handling [DEF-16]: with no configured staff/tutor role
+        # IDs the bot must not write ANY role data to the CRM — a wrong guess
+        # could escalate a member or demote a real admin. Local records and class
+        # enrolment still run; only the portal push is withheld.
+        classification_on = config.role_classification_configured()
+        if not classification_on:
+            log.warning(
+                "[members] STAFF_ROLE_IDS / TUTOR_ROLE_IDS are not configured — "
+                "FAIL-CLOSED: no member data will be pushed to the CRM this sync, so any "
+                "student who joined via Discord will be INVISIBLE to the CRM and their "
+                "voice attendance cannot be matched to a student. Set the role-ID env "
+                "vars (see REHOST.md) to enable the portal member sync."
+            )
+        else:
+            # Partial configuration is a fail-OPEN hazard: if a tier's role IDs are
+            # missing, its holders fall through to 'student' and can be mis-filed in
+            # the CRM. Make the partial state loud. [review: partial role IDs push parents as students]
+            if not config.PARENT_ROLE_IDS:
+                log.warning(
+                    "[members] PARENT_ROLE_IDS is not configured while classification is ON — "
+                    "a parent with no existing local record cannot be distinguished from a "
+                    "student and would be pushed to the CRM as a student. Set PARENT_ROLE_IDS "
+                    "(see REHOST.md)."
+                )
+            if not config.TUTOR_ROLE_IDS:
+                log.warning(
+                    "[members] TUTOR_ROLE_IDS is not configured while classification is ON — "
+                    "tutors cannot be distinguished from students. Set TUTOR_ROLE_IDS (see REHOST.md)."
+                )
+
         async with get_session() as session:
             # ── Fetch existing state in bulk ──────────────────────────────
-            existing_ids_result = await session.execute(select(User.discord_user_id, User.id))
-            discord_to_db_id: dict[int, int] = {row[0]: row[1] for row in existing_ids_result.all()}
+            existing_ids_result = await session.execute(
+                select(User.discord_user_id, User.id, User.role, User.active)
+            )
+            discord_to_db_id: dict[int, int] = {}
+            local_role_by_discord_id: dict[int, UserRole] = {}
+            local_active_by_discord_id: dict[int, bool] = {}
+            for row in existing_ids_result.all():
+                discord_to_db_id[row[0]] = row[1]
+                local_role_by_discord_id[row[0]] = row[2]
+                local_active_by_discord_id[row[0]] = row[3]
 
             # Class groups that have a Discord role mapped
             cg_result = await session.execute(
@@ -177,8 +225,42 @@ class MembersCog(commands.Cog):
                     continue
 
                 portal_role = self._detect_portal_role(member)
+                local_role = local_role_by_discord_id.get(member.id)
+                user_is_active = local_active_by_discord_id.get(member.id, True)
 
-                # ── Ensure a User record exists ───────────────────────────
+                # NEVER-DEMOTE-VIA-INFERENCE GUARD [DEF-16]: the bot must not
+                # rewrite a CRM-classified non-student down to a lower role just
+                # because the Discord role that identifies their tier is missing
+                # (dropped, or its *_ROLE_IDS env var unset). Demotions belong in
+                # the CRM, not in Discord role drift. Cases held:
+                #  • admin → anything else (strongest protection, always on)
+                #  • tutor → student when TUTOR_ROLE_IDS is unset
+                #  • parent → student when PARENT_ROLE_IDS is unset
+                # Held members keep their local role, are omitted from the push,
+                # and a human is told.
+                demote_hold = False
+                hold_detail = ""
+                if local_role == UserRole.admin and portal_role != UserRole.admin:
+                    demote_hold, hold_detail = True, "admin (no configured staff role)"
+                elif (local_role == UserRole.tutor and portal_role == UserRole.student
+                        and not config.TUTOR_ROLE_IDS):
+                    demote_hold, hold_detail = True, "tutor (TUTOR_ROLE_IDS unset)"
+                elif (local_role == UserRole.parent and portal_role == UserRole.student
+                        and not config.PARENT_ROLE_IDS):
+                    demote_hold, hold_detail = True, "parent (PARENT_ROLE_IDS unset)"
+                # Only worth telling a human when classification is ON — in
+                # fail-closed mode nothing is pushed for anyone, so the hold is
+                # moot and its warning would just bury the fail-closed one above.
+                # [review: admin_hold warning spams when classification unconfigured]
+                if demote_hold and classification_on:
+                    log.warning(
+                        "[members] %s (%d) is %s locally but Discord roles now imply a "
+                        "lower role — HOLDING (%s), not pushing a demotion. Resolve manually.",
+                        member.display_name, member.id,
+                        local_role.value if local_role else "?", hold_detail,
+                    )
+
+                # ── Ensure a User record exists / keep its role current ───
                 if member.id not in discord_to_db_id:
                     db_user = User(
                         discord_user_id=member.id,
@@ -189,26 +271,47 @@ class MembersCog(commands.Cog):
                     session.add(db_user)
                     await session.flush()
                     discord_to_db_id[member.id] = db_user.id
+                    local_role_by_discord_id[member.id] = portal_role
                     created += 1
                     log.debug("Provisional record created for %s (%d) as %s.", member, member.id, portal_role.value)
-                else:
-                    # Update role in the local DB too
-                    await session.execute(
-                        # Use raw update to avoid re-fetching each user
+                elif classification_on and not demote_hold and local_role != portal_role:
+                    # Real local role update (the old code here was a dead no-op
+                    # SELECT, so local roles drifted forever).
+                    user_result = await session.execute(
                         select(User).where(User.discord_user_id == member.id)
                     )
+                    db_user = user_result.scalar_one_or_none()
+                    if db_user is not None:
+                        db_user.role = portal_role
+                        local_role_by_discord_id[member.id] = portal_role
 
-                # Build portal payload entry
-                avatar = str(member.display_avatar.url) if member.display_avatar else None
-                portal_members.append({
-                    "discord_user_id": str(member.id),
-                    "full_name":       member.display_name,
-                    "avatar_url":      avatar,
-                    "role":            portal_role.value,
-                })
+                # ── Build the portal payload entry ────────────────────────
+                # Withheld entirely when classification is unconfigured (fail
+                # closed — the CRM writes `role` unconditionally, so any push
+                # could demote a CRM-set admin or escalate a guessed staff).
+                # Parents are never pushed as students [DEF-16]: the CRM wire
+                # contract has no parent role, and mis-filing a parent as a
+                # student corrupts the CRM's data classification.
+                # A soft-deactivated user (via /delete_user) must not be re-pushed
+                # to the CRM as a current member — the bot would silently resurrect
+                # the account it just deactivated. [review: deactivated users still pushed]
+                if classification_on and not demote_hold and portal_role != UserRole.parent and user_is_active:
+                    avatar = str(member.display_avatar.url) if member.display_avatar else None
+                    portal_members.append({
+                        "discord_user_id": str(member.id),
+                        "full_name":       member.display_name,
+                        "avatar_url":      avatar,
+                        "role":            portal_role.value,
+                    })
 
                 db_user_id = discord_to_db_id[member.id]
                 member_role_ids = {r.id for r in member.roles}
+
+                # Do not silently re-enrol a soft-deactivated user just because
+                # they still hold a mapped Discord role — that would reverse the
+                # deactivation /delete_user just reported. [review: soft-deactivated user auto re-enrolled]
+                if not user_is_active:
+                    continue
 
                 # ── Auto-enrol based on Discord roles ─────────────────────
                 for group in role_mapped_groups:
@@ -284,7 +387,7 @@ class MembersCog(commands.Cog):
         elif not config.DASHBOARD_API_KEY or not config.PORTAL_API_URL:
             log.warning(
                 "Member sync skipped for portal — DASHBOARD_API_KEY or PORTAL_API_URL not set. "
-                "Add both to the OCI .env and restart the bot."
+                "Add both to the deploy env vars and restart the bot."
             )
 
         return created, enrolled
@@ -322,8 +425,15 @@ class MembersCog(commands.Cog):
                 member, member.id, portal_role.value,
             )
 
-        # Push to portal API
-        if config.DASHBOARD_API_KEY and config.PORTAL_API_URL:
+        # Push to portal API — same fail-closed rules as the bulk sync [DEF-16]:
+        # no push at all when role classification is unconfigured, and parents
+        # are never pushed as students.
+        if (
+            config.DASHBOARD_API_KEY
+            and config.PORTAL_API_URL
+            and config.role_classification_configured()
+            and portal_role != UserRole.parent
+        ):
             try:
                 avatar = str(member.display_avatar.url) if member.display_avatar else None
                 async with PortalAPIClient() as client:
@@ -335,6 +445,12 @@ class MembersCog(commands.Cog):
                     }])
             except Exception:
                 log.exception("Could not push new member %s to portal API.", member.id)
+        elif not config.role_classification_configured():
+            log.warning(
+                "[members] on_member_join: role IDs unconfigured — %s (%d) recorded "
+                "locally only, NOT pushed to the CRM (fail-closed).",
+                member.display_name, member.id,
+            )
 
         await self._notify_admin(
             member.guild,
@@ -391,6 +507,17 @@ class MembersCog(commands.Cog):
                 session.add(db_user)
                 await session.flush()
                 log.info("Provisional record created for %s (%d) during role update.", after, after.id)
+
+            # Do not re-enrol a soft-deactivated user on a role re-add — that would
+            # reverse a deactivation an admin made via /delete_user. An existing
+            # inactive record must be explicitly reactivated first. [review: soft-deactivated re-enrolled]
+            if not db_user.active:
+                log.info(
+                    "[members] on_member_update: %s (%d) is deactivated locally — not "
+                    "auto-enrolling on role change. Reactivate the user first if intended.",
+                    after, after.id,
+                )
+                return
 
             newly_enrolled: list[ClassGroup] = []
 

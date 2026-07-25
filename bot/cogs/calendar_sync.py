@@ -16,7 +16,7 @@ import discord
 from discord import app_commands, Interaction
 from discord.ext import commands, tasks
 
-from bot import config
+from bot import config, health
 from bot.database import get_session
 from bot.models.class_group import ClassGroup
 from bot.models.lesson import Lesson
@@ -31,6 +31,7 @@ from bot.services.reminder_service import (
     has_reminder_been_sent,
     record_reminder,
 )
+from bot.utils.task_safety import install_loop_restart
 
 log = logging.getLogger(__name__)
 
@@ -40,6 +41,7 @@ _CANCELLED_RTYPE = "cancelled"
 class CalendarSyncCog(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+        install_loop_restart(self._sync_loop, "calendar_sync.sync", self.bot)
         self._sync_loop.start()
 
     def cog_unload(self) -> None:
@@ -55,6 +57,16 @@ class CalendarSyncCog(commands.Cog):
         try:
             counts = await sync_all_calendars()
             completed = datetime.now(timezone.utc).isoformat()
+            # Freshness signal for the heartbeat dead-man's-switch [M8]: the
+            # calendar subsystem counts as "working" when the cycle completed and
+            # at least one calendar synced (or there are none to sync). A single
+            # stale Google calendar (errors>0 but < total) must NOT suppress the
+            # heartbeat forever — only a total failure (every calendar errored,
+            # or the sync threw before returning) should let the dead-man's-switch
+            # fire. [review: heartbeat keyed solely to zero-error cycles]
+            groups_total = counts.get("groups_total", 0)
+            if counts.get("errors", 0) < groups_total or groups_total == 0:
+                health.record_sync_ok()
             log.info("Calendar sync complete: %s", {k: v for k, v in counts.items() if k != "newly_cancelled"})
             await self._handle_cancellations(counts.get("newly_cancelled", []))
             # New classes were just mirrored locally — enrol their Discord-role

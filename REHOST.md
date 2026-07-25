@@ -39,7 +39,10 @@ and are deliberately **not** deployed. They can be deleted in a later tidy-up.
    | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` / `GOOGLE_PROJECT_ID` | the Google OAuth app |
    | `GOOGLE_REFRESH_TOKEN` | run `python get_refresh_token.py` locally to mint one |
    | `DASHBOARD_API_KEY` | **must byte-match `BOT_API_SECRET` on `ryze-portal-api`** — if they differ, every sync silently 401s |
-   | `HEARTBEAT_URL` | *(optional)* see below |
+   | `HEARTBEAT_URL` | **required in production** — see below; without it the next outage is silent again |
+   | `STAFF_ROLE_IDS` | comma-separated Discord role IDs whose holders are CRM **admins**. UNSET = fail-closed: nobody classifies as staff and NO member data is pushed to the CRM |
+   | `TUTOR_ROLE_IDS` | comma-separated Discord role IDs whose holders are CRM **tutors** |
+   | `PARENT_ROLE_IDS` | comma-separated Discord role IDs for **parents** (recorded locally, never pushed as students) |
 
    `DATABASE_URL`, `PORTAL_API_URL`, `DEFAULT_TIMEZONE`, `LOG_LEVEL` are set by the
    Blueprint automatically.
@@ -54,6 +57,41 @@ and are deliberately **not** deployed. They can be deleted in a later tidy-up.
 2. Copy its ping URL into the `HEARTBEAT_URL` env var (grace period ≈ 2× the ping
    interval, i.e. ~10 min at the default 5-min interval).
 3. If the bot ever stops (host, crash-loop, billing lapse), the missed ping alerts you.
+
+## RELAUNCH-CHECKLIST — hard preconditions of creating the worker
+
+Per the 2026-07-25 leadership review, the worker is **not created until every box
+is ticked**. This is what stops "I'll do the Render stuff later" from accidentally
+deploying without the safeguarding bar. Boxes 1–7 are code (already on the
+deploy candidate branch — verify they're merged beneath the tip you deploy);
+8–12 are owner actions at deploy time.
+
+1. ☐ **Permission-sync grants validated** — a grant not backed by an enrolled
+   member/tutor of that class channel is refused and logged (DEF-15, with tests).
+2. ☐ **Role classification fail-closed** — staff/tutor status only via
+   `STAFF_ROLE_IDS`/`TUTOR_ROLE_IDS`; unset ⇒ zero CRM role writes; the bot
+   never demotes a CRM-set admin (DEF-16, with tests).
+3. ☐ **Every background loop has a crash-restart handler** — one bad tick can't
+   silently kill job polling / sync / reminders (DEF-18/H10).
+4. ☐ **Startup probe is real** — DB `SELECT 1` fail-fast; portal + Google
+   probed loudly at boot (M9).
+5. ☐ **Heartbeat proves work, not liveness** — ping suppressed when the gateway
+   is down or the last successful sync is stale, so the monitor fires (M8).
+6. ☐ **`/delete_user` is truthful** — soft-deactivate; failures surfaced;
+   history retained (H2/H5). Privacy-erasure requests follow the erasure runbook.
+7. ☐ **CI green** — the pytest gate on the deploy candidate passes.
+8. ☐ **Secrets set** on the worker (table above) including `HEARTBEAT_URL` +
+   an external heartbeat monitor created.
+9. ☐ **Role IDs supplied** (`STAFF_ROLE_IDS`/`TUTOR_ROLE_IDS`/`PARENT_ROLE_IDS`)
+   — or the owner explicitly accepts the fail-closed default (no CRM member sync).
+10. ☐ **DM policy applied** in Discord server settings (no unmonitored 1:1
+    adult↔minor contact; tuition communication in class channels).
+11. ☐ **Supervised smoke window** after first boot: startup-probe PASS lines,
+    first calendar sync succeeds, heartbeat monitor green, one test reminder,
+    portal push 200s.
+12. ☐ **7-day soak** before enabling permission-sync grant application or
+    starting any new feature wave: no loop-crash logs, heartbeat green, sync
+    logs honest.
 
 ## Known follow-ups (not blockers for coming back online)
 

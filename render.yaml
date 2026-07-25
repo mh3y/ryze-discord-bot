@@ -55,6 +55,16 @@ services:
       # ── Optional dead-man's-switch heartbeat (see REHOST.md) ──
       - key: HEARTBEAT_URL
         sync: false
+      # ── Role classification (DEF-16). Declared here so the Blueprint UI prompts
+      # for them; leaving them blank keeps the bot FAIL-CLOSED (no CRM member sync
+      # at all — new students never reach the CRM and their attendance can't be
+      # matched). Comma-separated Discord role IDs. See REHOST.md. ──
+      - key: STAFF_ROLE_IDS
+        sync: false
+      - key: TUTOR_ROLE_IDS
+        sync: false
+      - key: PARENT_ROLE_IDS
+        sync: false
 
 databases:
   - name: ryze-bot-db

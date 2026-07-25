@@ -53,6 +53,7 @@ from discord.ext import commands, tasks
 from bot import config
 from bot.services.google_calendar_service import list_calendars
 from bot.services.portal_api import PortalAPIClient, PortalAPIError
+from bot.utils.task_safety import install_loop_restart
 
 log = logging.getLogger(__name__)
 
@@ -128,6 +129,7 @@ class ClassDiscoveryCog(commands.Cog):
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+        install_loop_restart(self._discovery_loop, "class_discovery.discovery", self.bot)
         self._discovery_loop.start()
 
     def cog_unload(self) -> None:

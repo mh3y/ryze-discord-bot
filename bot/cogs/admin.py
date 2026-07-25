@@ -16,6 +16,35 @@ from bot.utils.time_utils import format_sydney, now_utc
 log = logging.getLogger(__name__)
 
 
+async def soft_deactivate_user(discord_user_id: int) -> int | None:
+    """Soft-delete a user: set the User row and all their memberships inactive.
+
+    Never hard-deletes — attendance_records / voice_sessions / homework rows FK
+    to users with no cascade, so a hard delete fails for anyone with history
+    (and would destroy records the business must retain). Returns the number of
+    memberships deactivated, or None when no record exists. Raises on failure —
+    the caller must surface it, never report success it didn't verify. [H2/H5]
+    """
+    async with get_session() as session:
+        result = await session.execute(
+            select(User).where(User.discord_user_id == discord_user_id)
+        )
+        db_user = result.scalar_one_or_none()
+        if db_user is None:
+            return None
+
+        memberships_result = await session.execute(
+            select(ClassGroupMember).where(ClassGroupMember.user_id == db_user.id)
+        )
+        deactivated = 0
+        for membership in memberships_result.scalars().all():
+            if membership.active:
+                membership.active = False
+                deactivated += 1
+        db_user.active = False
+    return deactivated
+
+
 # ── Delete confirmation UI ─────────────────────────────────────────────────── #
 
 class _ConfirmDeleteView(discord.ui.View):
@@ -26,7 +55,7 @@ class _ConfirmDeleteView(discord.ui.View):
         self.confirmed: bool = False
         self._user_name = user_name
 
-    @discord.ui.button(label="Yes, delete permanently", style=discord.ButtonStyle.danger, emoji="🗑️")
+    @discord.ui.button(label="Yes, deactivate", style=discord.ButtonStyle.danger, emoji="🗑️")
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         self.confirmed = True
         for item in self.children:
@@ -42,7 +71,7 @@ class _ConfirmDeleteView(discord.ui.View):
         await interaction.response.edit_message(
             embed=discord.Embed(
                 title="↩️  Cancelled",
-                description=f"**{self._user_name}**'s record was **not** deleted.",
+                description=f"**{self._user_name}**'s record was **not** changed.",
                 colour=discord.Colour.greyple(),
             ),
             view=self,
@@ -683,11 +712,11 @@ class AdminCog(commands.Cog):
 
     @app_commands.command(
         name="delete_user",
-        description="Remove a linked user record and all their class enrolments from the database.",
+        description="Deactivate a user's record + enrolments (soft delete — data retained per policy).",
     )
     @app_commands.guild_only()
     @app_commands.describe(
-        discord_user="The Discord member whose record should be deleted",
+        discord_user="The Discord member whose record should be deactivated",
         remove_discord_roles="Also strip the bot-managed Discord roles from this member",
     )
     @app_commands.default_permissions(administrator=True)
@@ -727,11 +756,13 @@ class AdminCog(commands.Cog):
             details.append("• Discord roles: **will be stripped**")
 
         confirm_embed = discord.Embed(
-            title="⚠️  Confirm Permanent Deletion",
+            title="⚠️  Confirm Deactivation",
             description=(
-                f"You are about to permanently delete {discord_user.mention}'s record.\n\n"
+                f"You are about to deactivate {discord_user.mention}'s record.\n\n"
                 + "\n".join(details)
-                + "\n\n**This cannot be undone.**"
+                + "\n\nThe record and its history are **retained** (soft delete) per the "
+                "data-retention policy; attendance/homework history stays intact. "
+                "For a privacy **erasure** request, follow the erasure runbook instead."
             ),
             colour=discord.Colour.red(),
         )
@@ -744,28 +775,37 @@ class AdminCog(commands.Cog):
         if timed_out or not view.confirmed:
             return
 
-        # ── Perform deletion ──────────────────────────────────────────────
-        async with get_session() as session:
-            # Re-fetch inside the new session
-            result = await session.execute(
-                select(User).where(User.discord_user_id == discord_user.id)
+        # ── Perform soft-delete ───────────────────────────────────────────
+        # Hard-deleting a User is a lie waiting to happen: attendance_records,
+        # voice_sessions and homework rows FK to users with NO cascade, so the
+        # commit blows up for any student with history — after the old code had
+        # already shown a success embed. Soft-delete (the codebase's active-flag
+        # pattern) always succeeds, keeps history intact, and any real failure
+        # is surfaced instead of swallowed. [H2/H5]
+        try:
+            deactivated_memberships = await soft_deactivate_user(discord_user.id)
+        except Exception as exc:
+            log.exception("delete_user: soft-deactivate failed for %s", discord_user.id)
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title="❌  Deactivation FAILED",
+                    description=(
+                        f"Could not deactivate **{saved_name}**'s record — nothing was changed.\n"
+                        f"```{exc}```"
+                    ),
+                    colour=discord.Colour.red(),
+                ),
+                ephemeral=True,
             )
-            db_user2 = result.scalar_one_or_none()
-            if not db_user2:
-                await interaction.followup.send("Record already deleted.", ephemeral=True)
-                return
-
-            memberships_result = await session.execute(
-                select(ClassGroupMember).where(ClassGroupMember.user_id == db_user2.id)
-            )
-            fresh_memberships = list(memberships_result.scalars().all())
-            for m in fresh_memberships:
-                await session.delete(m)
-            await session.delete(db_user2)
+            return
+        if deactivated_memberships is None:
+            await interaction.followup.send("Record already removed.", ephemeral=True)
+            return
 
         result_lines: list[str] = [
-            f"🗑️  **Deleted** record for **{saved_name}** ({discord_user.mention}).",
-            f"• Removed **{len(fresh_memberships)}** class enrolment(s).",
+            f"🗑️  **Deactivated** record for **{saved_name}** ({discord_user.mention}).",
+            f"• Deactivated **{deactivated_memberships}** class enrolment(s).",
+            "• History (attendance / homework) retained per the data-retention policy.",
         ]
 
         if remove_discord_roles:
@@ -786,7 +826,7 @@ class AdminCog(commands.Cog):
                     result_lines.append(f"• {note}")
 
         done_embed = discord.Embed(
-            title="🗑️  User Deleted",
+            title="🗑️  User Deactivated",
             description="\n".join(result_lines),
             colour=discord.Colour.greyple(),
         )

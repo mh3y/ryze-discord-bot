@@ -17,6 +17,7 @@ from bot.services.homework_service import (
 from bot.services.discord_service import get_discord_member, safe_send_dm
 from bot.services.lesson_service import get_lesson_by_id
 from bot.utils.time_utils import SYDNEY_TZ, format_sydney, now_utc
+from bot.utils.task_safety import install_loop_restart
 
 log = logging.getLogger(__name__)
 
@@ -29,6 +30,7 @@ class HomeworkCog(commands.Cog):
         # lessons.id — task IDs are not valid lesson IDs).
         # Resets on bot restart, which is acceptable for homework reminders.
         self._reminded: set[tuple[int, int]] = set()  # (task_id, student_db_id)
+        install_loop_restart(self._hw_reminder_loop, "homework.reminder", self.bot)
         self._hw_reminder_loop.start()
 
     def cog_unload(self) -> None:

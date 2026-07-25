@@ -13,6 +13,7 @@ from bot.services.discord_service import create_lesson_thread
 from bot.services.lesson_service import get_lesson_by_id, get_upcoming_lessons
 from bot.services.reminder_service import get_lesson_members
 from bot.utils.time_utils import now_utc
+from bot.utils.task_safety import install_loop_restart
 
 log = logging.getLogger(__name__)
 
@@ -20,6 +21,7 @@ log = logging.getLogger(__name__)
 class LessonThreadsCog(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+        install_loop_restart(self._thread_loop, "lesson_threads.thread", self.bot)
         self._thread_loop.start()
 
     def cog_unload(self) -> None:

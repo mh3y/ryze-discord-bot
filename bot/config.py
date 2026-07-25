@@ -28,6 +28,40 @@ GOOGLE_PROJECT_ID: str = _require("GOOGLE_PROJECT_ID")
 DEFAULT_TIMEZONE: str = os.getenv("DEFAULT_TIMEZONE", "Australia/Sydney")
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
+
+def _parse_role_id_set(key: str) -> frozenset[int]:
+    """Parse a comma-separated list of Discord role IDs from the environment.
+
+    Fails loudly on a malformed entry rather than silently ignoring it — a
+    typo'd staff role ID must not quietly change who counts as staff. [DEF-16]
+    """
+    raw = os.getenv(key, "")
+    ids: set[int] = set()
+    for part in raw.replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            ids.add(int(part))
+        except ValueError:
+            raise RuntimeError(f"{key} contains a non-numeric Discord role ID: {part!r}")
+    return frozenset(ids)
+
+
+# Role classification (DEF-16) — staff/tutor status is granted ONLY via these
+# explicitly configured Discord role IDs, never by role NAME (any member with
+# Manage Roles can create a role named "Admin"; they cannot mint a configured ID).
+# UNSET = fail closed: nobody classifies as staff and NO member roles are pushed
+# to the CRM (see MembersCog). Supplied by the owner as deploy-time env values.
+STAFF_ROLE_IDS: frozenset[int] = _parse_role_id_set("STAFF_ROLE_IDS")    # → CRM 'admin'
+TUTOR_ROLE_IDS: frozenset[int] = _parse_role_id_set("TUTOR_ROLE_IDS")    # → CRM 'tutor'
+PARENT_ROLE_IDS: frozenset[int] = _parse_role_id_set("PARENT_ROLE_IDS")  # parents: never pushed as students
+
+
+def role_classification_configured() -> bool:
+    """True when the owner has supplied at least one staff/tutor role ID."""
+    return bool(STAFF_ROLE_IDS or TUTOR_ROLE_IDS)
+
 # Heartbeat / dead-man's-switch (optional). If HEARTBEAT_URL is set, the bot pings
 # it every HEARTBEAT_INTERVAL_MINUTES; an external monitor (healthchecks.io /
 # UptimeRobot) alerts if the pings stop. Leave unset to disable (see heartbeat cog).

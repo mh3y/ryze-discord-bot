@@ -22,6 +22,7 @@ from bot.services.reminder_service import (
 )
 from bot.services.discord_service import safe_send_dm, get_discord_member
 from bot.utils.time_utils import now_utc
+from bot.utils.task_safety import install_loop_restart
 
 log = logging.getLogger(__name__)
 
@@ -29,6 +30,7 @@ log = logging.getLogger(__name__)
 class RemindersCog(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+        install_loop_restart(self._reminder_loop, "reminders.reminder", self.bot)
         self._reminder_loop.start()
 
     def cog_unload(self) -> None:

@@ -80,6 +80,58 @@ def _print_startup_health() -> None:
     log.info(sep)
 
 
+async def _run_startup_probe() -> None:
+    """Real connectivity probe — env-var PRESENCE is not health. [M9]
+
+    DB is fail-fast (a bot with no database can do nothing; exiting non-zero
+    mirrors the fail-closed migration posture and makes the deploy visibly
+    fail). Portal and Google failures are loud but non-fatal: the bot can still
+    capture voice state and self-heal when they recover.
+    """
+    from sqlalchemy import text
+
+    # ── Database: SELECT 1, fail fast ────────────────────────────────────────
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+        log.info("[probe] database:  ✅ PASS")
+    except Exception:
+        log.critical(
+            "[probe] database:  ❌ FAIL — DATABASE_URL is unreachable; refusing to start.",
+            exc_info=True,
+        )
+        raise
+
+    # ── Portal API: authenticated GET (proves URL + key together) ────────────
+    if config.PORTAL_API_URL and config.DASHBOARD_API_KEY:
+        try:
+            from bot.services.portal_api import PortalAPIClient
+            async with PortalAPIClient() as client:
+                await client.get_classes()
+            log.info("[probe] portal:    ✅ PASS")
+        except Exception:
+            log.error(
+                "[probe] portal:    ❌ FAIL — CRM unreachable or DASHBOARD_API_KEY wrong "
+                "(must equal BOT_API_SECRET on Render). Sync will not work until fixed.",
+                exc_info=True,
+            )
+    else:
+        log.warning("[probe] portal:    ⚠️ SKIPPED — PORTAL_API_URL / DASHBOARD_API_KEY not set.")
+
+    # ── Google Calendar: credential refresh (blocking libs → executor) ───────
+    try:
+        from google.auth.transport.requests import Request
+        from bot.services.google_calendar_service import _build_credentials
+        creds = _build_credentials()
+        await asyncio.get_running_loop().run_in_executor(None, creds.refresh, Request())
+        log.info("[probe] google:    ✅ PASS")
+    except Exception:
+        log.error(
+            "[probe] google:    ❌ FAIL — calendar sync will not work (check GOOGLE_* env vars).",
+            exc_info=True,
+        )
+
+
 class RyzeBot(commands.Bot):
     def __init__(self) -> None:
         intents = discord.Intents.default()
@@ -139,6 +191,7 @@ class RyzeBot(commands.Bot):
 async def main() -> None:
     setup_logging()
     _print_startup_health()
+    await _run_startup_probe()  # fail-fast on DB, loud on portal/Google [M9]
     bot = RyzeBot()
     async with bot:
         await bot.start(config.DISCORD_TOKEN)
