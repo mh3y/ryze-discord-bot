@@ -2,6 +2,7 @@
 import pytest
 from datetime import datetime, timezone, timedelta
 
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from bot.models.attendance import AttendanceRecord, AttendanceStatus, MarkedBy
@@ -231,10 +232,20 @@ class TestAttendanceModel:
 
     async def test_all_attendance_statuses_persist(self, db_session):
         user, group, lesson = await self._setup(db_session, 777888999000111003)
-        for i, status in enumerate(AttendanceStatus):
-            r = AttendanceRecord(lesson_id=lesson.id, user_id=user.id, status=status, total_minutes=i * 10)
+        # Distinct user_id per row: the uq_attendance_lesson_user constraint (M1)
+        # allows only one attendance row per (lesson, user), so vary the user to
+        # exercise every status value. (FK enforcement is OFF in the harness.)
+        statuses = list(AttendanceStatus)
+        for i, status in enumerate(statuses):
+            r = AttendanceRecord(lesson_id=lesson.id, user_id=user.id + i, status=status, total_minutes=i * 10)
             db_session.add(r)
         await db_session.flush()
+        rows = (
+            await db_session.execute(
+                select(AttendanceRecord).where(AttendanceRecord.lesson_id == lesson.id)
+            )
+        ).scalars().all()
+        assert {r.status for r in rows} == set(statuses)
 
     async def test_marked_by_tutor(self, db_session):
         user, group, lesson = await self._setup(db_session, 777888999000111004)

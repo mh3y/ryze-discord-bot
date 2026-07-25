@@ -2,7 +2,7 @@ import enum
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Optional
 
-from sqlalchemy import BigInteger, DateTime, Enum, ForeignKey, Integer, Text
+from sqlalchemy import BigInteger, DateTime, Enum, ForeignKey, Integer, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from bot.database import Base
@@ -37,6 +37,12 @@ class DiscordVerificationStatus(str, enum.Enum):
 
 class AttendanceRecord(Base):
     __tablename__ = "attendance_records"
+    # One attendance row per (lesson, user). Without this, the SELECT-then-INSERT in
+    # get_or_create_attendance_record can race under concurrent voice events, splitting
+    # total_minutes across duplicate rows and risking MultipleResultsFound (DEF-22 / M1).
+    __table_args__ = (
+        UniqueConstraint("lesson_id", "user_id", name="uq_attendance_lesson_user"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     lesson_id: Mapped[int] = mapped_column(

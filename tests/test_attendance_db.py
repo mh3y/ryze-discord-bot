@@ -404,3 +404,96 @@ class TestCloseOpenSessions:
         assert closed == 1
         record = await _get_attendance(db_session, lesson.id, student.id)
         assert record.total_minutes == 0
+
+
+# ---------------------------------------------------------------------------
+# M1 / DEF-22 — unique (lesson_id, user_id) constraint + race recovery
+# ---------------------------------------------------------------------------
+
+class TestAttendanceUniqueConstraint:
+    async def test_duplicate_attendance_rows_rejected(self, db_session):
+        """The uq_attendance_lesson_user constraint forbids a second attendance
+        row for the same (lesson, user)."""
+        from sqlalchemy.exc import IntegrityError
+
+        group = await _make_group(db_session)
+        lesson = await _make_lesson(db_session, group)
+        student = await _make_student(db_session, 100_000_1)
+
+        db_session.add(
+            AttendanceRecord(lesson_id=lesson.id, user_id=student.id,
+                             status=AttendanceStatus.present, total_minutes=10)
+        )
+        await db_session.flush()
+
+        db_session.add(
+            AttendanceRecord(lesson_id=lesson.id, user_id=student.id,
+                             status=AttendanceStatus.late, total_minutes=5)
+        )
+        with pytest.raises(IntegrityError):
+            await db_session.flush()
+
+    async def test_get_or_create_returns_same_row(self, db_session):
+        """Repeated calls return the identical row — no duplicate is created."""
+        group = await _make_group(db_session)
+        lesson = await _make_lesson(db_session, group)
+        student = await _make_student(db_session, 100_000_2)
+
+        first = await get_or_create_attendance_record(db_session, lesson.id, student.id)
+        second = await get_or_create_attendance_record(db_session, lesson.id, student.id)
+        assert first.id == second.id
+
+        rows = (
+            await db_session.execute(
+                select(AttendanceRecord).where(
+                    and_(AttendanceRecord.lesson_id == lesson.id,
+                         AttendanceRecord.user_id == student.id)
+                )
+            )
+        ).scalars().all()
+        assert len(rows) == 1
+
+    async def test_get_or_create_recovers_from_concurrent_insert(self, db_session, monkeypatch):
+        """If a concurrent voice event inserts the row between our existence check
+        and our flush, the constraint raises IntegrityError; get_or_create rolls
+        back the failed insert (SAVEPOINT) and returns the row that won the race."""
+        import bot.services.attendance_service as svc
+
+        group = await _make_group(db_session)
+        lesson = await _make_lesson(db_session, group)
+        student = await _make_student(db_session, 100_000_3)
+
+        # The "winner" — as if a concurrent session inserted it first.
+        winner = AttendanceRecord(lesson_id=lesson.id, user_id=student.id,
+                                  status=AttendanceStatus.present, total_minutes=30)
+        db_session.add(winner)
+        await db_session.flush()
+        winner_id = winner.id
+
+        # Force only the FIRST existence check to miss, simulating the race where
+        # our SELECT ran before the other session committed. The recovery SELECT
+        # runs the real query and finds the winner.
+        real_select = svc._select_attendance_record
+        calls = {"n": 0}
+
+        async def flaky(session, lesson_id, user_id):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return None
+            return await real_select(session, lesson_id, user_id)
+
+        monkeypatch.setattr(svc, "_select_attendance_record", flaky)
+
+        got = await get_or_create_attendance_record(db_session, lesson.id, student.id)
+        assert got.id == winner_id          # returned the existing row
+        assert calls["n"] == 2              # recovery path was exercised
+
+        rows = (
+            await db_session.execute(
+                select(AttendanceRecord).where(
+                    and_(AttendanceRecord.lesson_id == lesson.id,
+                         AttendanceRecord.user_id == student.id)
+                )
+            )
+        ).scalars().all()
+        assert len(rows) == 1               # no duplicate survived

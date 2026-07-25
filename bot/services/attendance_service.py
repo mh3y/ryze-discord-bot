@@ -4,6 +4,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from sqlalchemy import select, and_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.database import get_session
@@ -53,9 +54,9 @@ def calculate_attendance_status(
     return AttendanceStatus.left_early
 
 
-async def get_or_create_attendance_record(
+async def _select_attendance_record(
     session: AsyncSession, lesson_id: int, user_id: int
-) -> AttendanceRecord:
+) -> Optional[AttendanceRecord]:
     result = await session.execute(
         select(AttendanceRecord).where(
             and_(
@@ -64,17 +65,38 @@ async def get_or_create_attendance_record(
             )
         )
     )
-    record = result.scalar_one_or_none()
-    if not record:
-        record = AttendanceRecord(
-            lesson_id=lesson_id,
-            user_id=user_id,
-            status=AttendanceStatus.unknown,
-            total_minutes=0,
-        )
-        session.add(record)
-        await session.flush()
-    return record
+    return result.scalar_one_or_none()
+
+
+async def get_or_create_attendance_record(
+    session: AsyncSession, lesson_id: int, user_id: int
+) -> AttendanceRecord:
+    record = await _select_attendance_record(session, lesson_id, user_id)
+    if record is not None:
+        return record
+
+    # The row didn't exist a moment ago, but a concurrent voice event (its own
+    # session) may insert the same (lesson_id, user_id) between our SELECT and our
+    # flush. The uq_attendance_lesson_user constraint (DEF-22/M1) turns that race
+    # into an IntegrityError instead of a duplicate row; wrap the insert in a
+    # SAVEPOINT so we can roll back just this insert (on Postgres a failed flush
+    # aborts the whole transaction otherwise) and re-select the winning row.
+    record = AttendanceRecord(
+        lesson_id=lesson_id,
+        user_id=user_id,
+        status=AttendanceStatus.unknown,
+        total_minutes=0,
+    )
+    try:
+        async with session.begin_nested():
+            session.add(record)
+            await session.flush()
+        return record
+    except IntegrityError:
+        existing = await _select_attendance_record(session, lesson_id, user_id)
+        if existing is None:
+            raise
+        return existing
 
 
 async def open_voice_session(
