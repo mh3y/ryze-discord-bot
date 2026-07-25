@@ -1,0 +1,35 @@
+# CI gate — replaces the retired deploy.yml (which targeted the reclaimed OCI host
+# and ran zero tests). Deployment now happens via Render (see render.yaml + REHOST.md);
+# this workflow's only job is to block merges that break the suite.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio pytest-mock
+
+      - name: Syntax check
+        run: python -m compileall -q bot tests
+
+      # Full ruff lint arrives with the legacy bot/api deletion (Wave D-lite);
+      # until then it would fail on dead code that is scheduled for removal.
+      - name: Tests
+        run: python -m pytest -q
