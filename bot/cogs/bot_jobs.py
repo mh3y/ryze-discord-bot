@@ -203,13 +203,21 @@ class BotJobsCog(commands.Cog):
         cog = self.bot.cogs.get("CalendarSyncCog")
         if not cog:
             raise RuntimeError("CalendarSyncCog not loaded — cannot run calendar sync")
-        # Call the cog's sync loop body directly (same code path as scheduled)
-        from bot.services.lesson_service import sync_all_calendars_portal as sync_all_calendars
+        # Call the cog's sync loop body directly (same code path as scheduled):
+        # hydrate local class groups from the portal, then run the local-first sync.
+        from bot.services.lesson_service import sync_all_calendars_hydrated as sync_all_calendars
         from datetime import datetime, timezone
         started = datetime.now(timezone.utc).isoformat()
         counts = await sync_all_calendars()
         completed = datetime.now(timezone.utc).isoformat()
         await cog._handle_cancellations(counts.get("newly_cancelled", []))
+        # Newly-mirrored classes need their Discord-role holders enrolled now so
+        # reminders have recipients before the next fire. Best-effort. [DEF-2]
+        if counts.get("hydrated_groups_created", 0) > 0:
+            try:
+                await self._trigger_member_sync()
+            except Exception:
+                log.exception("[bot_jobs] Post-sync member enrollment refresh failed.")
         # Log the admin-triggered sync
         if config.DASHBOARD_API_KEY and config.PORTAL_API_URL:
             async with PortalAPIClient() as client:

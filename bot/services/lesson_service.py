@@ -1,9 +1,10 @@
 """CRUD and query operations for lessons and class groups."""
+import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
-from sqlalchemy import select, and_
+from sqlalchemy import select, and_, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -21,6 +22,12 @@ def _get_portal_client():
     return PortalAPIClient, PortalAPIError
 
 log = logging.getLogger(__name__)
+
+# Serialises the calendar-sync entrypoints (scheduled loop, admin /sync_calendar,
+# and the bot-jobs poller) so their hydration steps can't interleave and insert
+# duplicate ClassGroup rows for the same google_calendar_id. Single-process
+# (one Render worker) — a DB unique constraint would be the multi-instance guard.
+_sync_lock = asyncio.Lock()
 
 
 async def get_active_class_groups(session: AsyncSession) -> list[ClassGroup]:
@@ -90,6 +97,9 @@ async def get_upcoming_lessons(
                 Lesson.start_time >= now,
                 Lesson.start_time <= cutoff,
                 Lesson.status == LessonStatus.scheduled,
+                # Don't remind for lessons of a deactivated/archived class group
+                # (hydration sets active=False when a class drops out of the portal).
+                Lesson.class_group.has(ClassGroup.active.is_(True)),
             )
         )
         .options(selectinload(Lesson.class_group).selectinload(ClassGroup.tutor))
@@ -143,7 +153,9 @@ async def sync_calendar_for_group(session: AsyncSession, group: ClassGroup) -> d
     if not group.google_calendar_id:
         return {"created": 0, "updated": 0, "cancelled": 0, "skipped": 0, "newly_cancelled": []}
 
-    events = fetch_upcoming_events(group.google_calendar_id, config.CALENDAR_SYNC_DAYS_AHEAD)
+    events = fetch_upcoming_events(
+        group.google_calendar_id, config.CALENDAR_SYNC_DAYS_AHEAD, config.CALENDAR_SYNC_DAYS_BACK
+    )
     created = updated = cancelled = skipped = 0
     newly_cancelled: list[Lesson] = []
 
@@ -203,6 +215,179 @@ async def sync_calendar_for_group(session: AsyncSession, group: ClassGroup) -> d
         "skipped": skipped,
         "newly_cancelled": newly_cancelled,
     }
+
+
+def _as_int_or_none(val) -> Optional[int]:
+    """Discord snowflakes are stored as strings in the portal, but the local
+    ClassGroup columns are BigInteger. Convert defensively; treat anything
+    unparseable (or empty) as absent rather than raising."""
+    if val is None or val == "":
+        return None
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return None
+
+
+async def hydrate_local_class_groups(session: AsyncSession, portal_classes: list[dict]) -> dict:
+    """Upsert the given portal classes into the local ClassGroup table.
+
+    The bot's reminder/homework/cancellation subsystem reads a LOCAL relational
+    graph (ClassGroup → ClassGroupMember → Lesson). ``class_discovery`` provisions
+    classes into the PORTAL only, so in production the local ClassGroup table is
+    empty and that whole subsystem is inert (DEF-2/DEF-3). Mirroring each active
+    portal class into a local ClassGroup lets the existing local-first sync and
+    the existing Discord-role enrollment (members cog) populate the rest.
+
+    Matched by ``google_calendar_id`` (the natural key both sides share). Discord
+    channel/role IDs are only ever SET from the portal, never nulled out — the
+    portal is the source of truth but a transiently-missing ID must not clobber a
+    working local one (that would silently disable enrollment/notifications). A
+    class that has dropped out of the portal (archived — ``get_classes`` returns
+    active only) is deactivated locally so it stops firing reminders, but ONLY
+    when the portal returned a non-empty set, so a transient empty/partial
+    response can never mass-deactivate. Tutor is intentionally NOT set: the portal
+    exposes only a CRM ``tutor_id``, not the tutor's Discord ID, so hydrated groups
+    have ``tutor_user_id=None`` and their tutor is reached only if they hold the
+    class Discord role (documented limitation).
+
+    The existing-row lookup tolerates pre-existing duplicates (``.first()`` rather
+    than ``scalar_one_or_none``) so a stray duplicate can't wedge every future
+    hydration with ``MultipleResultsFound``. Idempotent. Returns
+    ``{"created", "updated", "skipped", "deactivated"}``.
+    """
+    created = updated = skipped = deactivated = 0
+    seen_cal_ids: set[str] = set()
+
+    for cls in portal_classes:
+        cal_id = cls.get("google_calendar_id")
+        if not cal_id:
+            # Without a calendar we can't sync lessons for this class anyway.
+            skipped += 1
+            continue
+        seen_cal_ids.add(cal_id)
+
+        text_channel_id = _as_int_or_none(cls.get("discord_channel_id"))
+        role_id = _as_int_or_none(cls.get("discord_role_id"))
+
+        existing_result = await session.execute(
+            select(ClassGroup)
+            .where(ClassGroup.google_calendar_id == cal_id)
+            .order_by(ClassGroup.id)
+            .limit(1)
+        )
+        group = existing_result.scalars().first()
+
+        if group is None:
+            group = ClassGroup(
+                name=cls.get("name") or "Class",
+                subject=cls.get("subject"),
+                google_calendar_id=cal_id,
+                discord_text_channel_id=text_channel_id,
+                discord_role_id=role_id,
+                active=True,
+            )
+            session.add(group)
+            created += 1
+            continue
+
+        changed = False
+        new_name = cls.get("name")
+        if new_name and group.name != new_name:
+            group.name = new_name
+            changed = True
+        if group.subject != cls.get("subject"):
+            group.subject = cls.get("subject")
+            changed = True
+        # Only set Discord IDs when the portal actually has them — never null out.
+        if text_channel_id is not None and group.discord_text_channel_id != text_channel_id:
+            group.discord_text_channel_id = text_channel_id
+            changed = True
+        if role_id is not None and group.discord_role_id != role_id:
+            group.discord_role_id = role_id
+            changed = True
+        if not group.active:
+            group.active = True
+            changed = True
+        if changed:
+            updated += 1
+
+    # Deactivate local groups that have dropped out of the portal (archived).
+    # Guarded: only when we actually saw calendars this cycle, so a transient
+    # empty/failed portal response never mass-deactivates every class.
+    if seen_cal_ids:
+        stale_result = await session.execute(
+            select(ClassGroup).where(
+                and_(
+                    ClassGroup.active.is_(True),
+                    ClassGroup.google_calendar_id.isnot(None),
+                    ClassGroup.google_calendar_id.notin_(list(seen_cal_ids)),
+                )
+            )
+        )
+        for stale in stale_result.scalars().all():
+            stale.active = False
+            deactivated += 1
+
+    await session.flush()
+    log.info(
+        "[hydrate] Local class groups from portal: created=%d updated=%d skipped=%d deactivated=%d",
+        created, updated, skipped, deactivated,
+    )
+    return {"created": created, "updated": updated, "skipped": skipped, "deactivated": deactivated}
+
+
+async def hydrate_local_class_groups_from_portal(session: AsyncSession) -> dict:
+    """Fetch the active portal classes and mirror them into local ClassGroups.
+
+    Thin wrapper over :func:`hydrate_local_class_groups` that does the network
+    fetch. Fails soft — a portal fetch error logs and returns zero counts rather
+    than aborting the whole sync cycle.
+    """
+    if not config.DASHBOARD_API_KEY or not config.PORTAL_API_URL:
+        log.warning("[hydrate] DASHBOARD_API_KEY or PORTAL_API_URL not set — skipping class-group hydration.")
+        return {"created": 0, "updated": 0, "skipped": 0, "deactivated": 0}
+
+    PortalAPIClient, _ = _get_portal_client()
+    try:
+        async with PortalAPIClient() as client:
+            portal_classes = await client.get_classes()
+    except Exception as exc:
+        log.error("[hydrate] Failed to fetch portal classes for hydration: %s", exc)
+        return {"created": 0, "updated": 0, "skipped": 0, "deactivated": 0}
+
+    return await hydrate_local_class_groups(session, portal_classes)
+
+
+async def sync_all_calendars_hydrated() -> dict:
+    """Production calendar-sync entrypoint.
+
+    Mirrors the portal's classes into the local ClassGroup table, then runs the
+    local-first :func:`sync_all_calendars` — which upserts local Lessons, detects
+    newly-cancelled lessons, and pushes everything back to the portal. Without the
+    hydration step the local ClassGroup table is empty in production, so the
+    local-first sync no-ops and reminders/threads/homework/cancellations never
+    fire (DEF-2/DEF-3). Hydration makes that existing, tested path work.
+
+    Serialised by ``_sync_lock`` so overlapping entrypoints (scheduled loop, admin
+    command, bot-jobs poller) can't race and create duplicate ClassGroups. The
+    returned dict carries ``hydrated_groups_created`` so the caller can refresh
+    Discord-role enrollment when new classes first appear (otherwise reminders for
+    a freshly-mirrored class have no recipients until the members cog's 6-hourly
+    loop runs).
+    """
+    async with _sync_lock:
+        hydrate_counts = {"created": 0, "updated": 0, "skipped": 0, "deactivated": 0}
+        if config.DASHBOARD_API_KEY and config.PORTAL_API_URL:
+            try:
+                async with get_session() as session:
+                    hydrate_counts = await hydrate_local_class_groups_from_portal(session)
+            except Exception:
+                # Hydration is best-effort; never let it abort the sync that follows.
+                log.exception("[hydrate] Class-group hydration failed — continuing with existing local groups.")
+        result = await sync_all_calendars()
+    result["hydrated_groups_created"] = hydrate_counts.get("created", 0)
+    return result
 
 
 async def sync_all_calendars_portal() -> dict:
@@ -393,9 +578,19 @@ async def _push_lessons_to_portal(synced_groups: list[ClassGroup]) -> None:
                     select(Lesson).where(
                         and_(
                             Lesson.class_group_id.in_(list(group_to_portal_id.keys())),
-                            Lesson.start_time >= now - timedelta(days=1),  # include today's lessons
+                            # Match the fetch lookback so lessons missed during an
+                            # outage are backfilled to the portal, not just today's.
+                            Lesson.start_time >= now - timedelta(days=config.CALENDAR_SYNC_DAYS_BACK),
                             Lesson.start_time <= cutoff,
                             Lesson.google_event_id.isnot(None),
+                            # Don't re-push a PAST lesson that's still 'scheduled':
+                            # it would revert a CRM-side completed/cancelled back to
+                            # scheduled every cycle. Future lessons and terminal
+                            # (completed/cancelled) past lessons still propagate.
+                            or_(
+                                Lesson.start_time >= now,
+                                Lesson.status != LessonStatus.scheduled,
+                            ),
                         )
                     )
                 )

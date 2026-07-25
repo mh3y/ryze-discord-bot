@@ -37,6 +37,9 @@ HEARTBEAT_INTERVAL_MINUTES: int = int(os.getenv("HEARTBEAT_INTERVAL_MINUTES", "5
 # Calendar sync
 CALENDAR_SYNC_INTERVAL: int = int(os.getenv("CALENDAR_SYNC_INTERVAL", "10"))
 CALENDAR_SYNC_DAYS_AHEAD: int = int(os.getenv("CALENDAR_SYNC_DAYS_AHEAD", "30"))
+# How far back lessons are fetched/pushed. Matches fetch_upcoming_events' default
+# lookback so past lessons missed during an outage are backfilled to the portal.
+CALENDAR_SYNC_DAYS_BACK: int = int(os.getenv("CALENDAR_SYNC_DAYS_BACK", "14"))
 
 # Reminder offsets in minutes before lesson start
 REMINDER_OFFSETS_MINUTES: list[int] = [24 * 60, 60, 15]
