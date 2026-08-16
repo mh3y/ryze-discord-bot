@@ -19,6 +19,10 @@ the host, and that rebuilds itself.
 - **No connection code change was needed.** `bot/database.py` already converts a
   `postgresql://` URL to the asyncpg driver, and `migrations/env.py` converts it to
   psycopg2 for Alembic, so Render's connection string works as-is.
+- **`runtime.txt`** pins Python to `3.12.10` (the version the suite was verified on).
+  Without it Render's native `python` runtime drifts to its current default (3.13+),
+  where discord.py's `audioop` import behaves differently — this keeps the fail-closed
+  boot reproducible.
 
 The legacy FastAPI (`bot/api/`) and the nginx + React `web` service in
 `docker-compose.yml` are **superseded** by the CRM (Render API + Vercel frontend)
@@ -26,11 +30,21 @@ and are deliberately **not** deployed. They can be deleted in a later tidy-up.
 
 ## Deploy steps (owner)
 
-1. **Render → New → Blueprint**, connect the `mh3y/ryze-discord-bot` repo. Render
+1. **Land the deploy candidate on `master` (the branch the Blueprint tracks).**
+   `render.yaml` pins `branch: master`, but the entire rehost — `render.yaml` itself,
+   `bot/cogs/heartbeat.py`, the M1 attendance-uniqueness migration, and the
+   DEF-15/16/18 safeguards — lives on `integration/pre-deploy` and is **not yet on
+   `master`**. `master` is a clean ancestor, so this is a zero-conflict fast-forward:
+   ```
+   git checkout master && git merge --ff-only integration/pre-deploy && git push origin master
+   ```
+   Do this **first** — skipping it means the Blueprint finds no `render.yaml`, or
+   deploys the old un-hardened `master`.
+2. **Render → New → Blueprint**, connect the `mh3y/ryze-discord-bot` repo. Render
    reads `render.yaml` and proposes the `ryze-discord-bot` worker + `ryze-bot-db`
    Postgres. Both are on the **Starter** plan (~$7/mo worker; the free Postgres is
    deleted after 90 days, so Starter is used for durability). Adjust if you prefer.
-2. **Set the secret env vars** on the worker (they are `sync:false`, so not in the
+3. **Set the secret env vars** on the worker (they are `sync:false`, so not in the
    repo):
    | Var | Value |
    |---|---|
@@ -39,7 +53,7 @@ and are deliberately **not** deployed. They can be deleted in a later tidy-up.
    | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` / `GOOGLE_PROJECT_ID` | the Google OAuth app |
    | `GOOGLE_REFRESH_TOKEN` | run `python get_refresh_token.py` locally to mint one |
    | `DASHBOARD_API_KEY` | **must byte-match `BOT_API_SECRET` on `ryze-portal-api`** — if they differ, every sync silently 401s |
-   | `HEARTBEAT_URL` | **required in production** — see below; without it the next outage is silent again |
+   | `HEARTBEAT_URL` | **strongly recommended** — not enforced in code (unset = heartbeat disabled, a safe no-op), but without it the next outage is silent again; treat as policy-required in production. See below. |
    | `STAFF_ROLE_IDS` | comma-separated Discord role IDs whose holders are CRM **admins**. UNSET = fail-closed: nobody classifies as staff and NO member data is pushed to the CRM |
    | `TUTOR_ROLE_IDS` | comma-separated Discord role IDs whose holders are CRM **tutors** |
    | `PARENT_ROLE_IDS` | comma-separated Discord role IDs for **parents** (recorded locally, never pushed as students) |
@@ -47,8 +61,8 @@ and are deliberately **not** deployed. They can be deleted in a later tidy-up.
 
    `DATABASE_URL`, `PORTAL_API_URL`, `DEFAULT_TIMEZONE`, `LOG_LEVEL` are set by the
    Blueprint automatically.
-3. **Deploy.** `alembic upgrade head` runs at boot (fail-closed) then the bot starts.
-4. **Verify** in the worker logs — look for the `RYZE EDUCATION BOT — STARTUP HEALTH
+4. **Deploy.** `alembic upgrade head` runs at boot (fail-closed) then the bot starts.
+5. **Verify** in the worker logs — look for the `RYZE EDUCATION BOT — STARTUP HEALTH
    CHECK` block with all ✓, then `Ryze Education Bot ready`. Confirm the bot shows
    online in Discord, and that a real class run records voice attendance in the CRM.
 
